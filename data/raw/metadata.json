@@ -1,9 +1,10 @@
 {
   "signs": {
-    "myanmar": {
+    "angry": {
       "num_samples": 30,
       "sequence_length": 30
     }
   },
-  "total_samples": 30
+  "total_samples": 30,
+  "emotion_stats": {}
 }

@@ -1,10 +1,12 @@
               precision    recall  f1-score   support
 
+       angry     0.0000    0.0000    0.0000         6
+     bat_ngo     0.5000    1.0000    0.6667         6
       cam_on     1.0000    1.0000    1.0000         6
   i_love_you     1.0000    1.0000    1.0000         6
      myanmar     1.0000    1.0000    1.0000         6
     xin_chao     1.0000    1.0000    1.0000         6
 
-    accuracy                         1.0000        24
-   macro avg     1.0000    1.0000    1.0000        24
-weighted avg     1.0000    1.0000    1.0000        24
+    accuracy                         0.8333        36
+   macro avg     0.7500    0.8333    0.7778        36
+weighted avg     0.7500    0.8333    0.7778        36

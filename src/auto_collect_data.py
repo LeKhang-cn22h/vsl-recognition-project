@@ -276,7 +276,7 @@ if __name__ == "__main__":
         "cảm ơn",
         "địa chỉ",
         "xin lỗi",
-        "tạm biệt"
+        "tạm biệt",
     ]
 
     print(f"Đang đọc data từ: {json_path}")

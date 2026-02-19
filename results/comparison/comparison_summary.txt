@@ -4,18 +4,18 @@ MODEL COMPARISON SUMMARY
 
 Model Name                Test Acc (%)    Test Loss       Train Time (s) 
 --------------------------------------------------------------------------------
-simple_lstm                       95.83%         0.3973           23.5
-bidirectional_lstm                95.83%         0.0869           15.8
-gru                              100.00%         0.0870            9.7
-cnn_lstm                         100.00%         0.0023           89.1
-attention_lstm                   100.00%         0.0001           29.2
-deep_lstm                         95.83%         0.1489           14.5
+simple_lstm                       83.33%         0.2319           19.2
+bidirectional_lstm                83.33%         0.2359           20.1
+gru                               83.33%         0.2343           27.7
+cnn_lstm                          83.33%         0.2332           47.7
+attention_lstm                    83.33%         0.2373           17.4
+deep_lstm                         83.33%         0.2334           38.1
 
 ================================================================================
 
-🏆 BEST MODEL: gru
-   - Accuracy: 100.00%
-   - Loss: 0.0870
-   - Training Time: 9.7s
+🏆 BEST MODEL: simple_lstm
+   - Accuracy: 83.33%
+   - Loss: 0.2319
+   - Training Time: 19.2s
 
 ================================================================================

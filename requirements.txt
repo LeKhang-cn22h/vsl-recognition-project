@@ -7,3 +7,4 @@ pandas
 matplotlib
 seaborn
 tqdm
+deepface --break-system-packages
