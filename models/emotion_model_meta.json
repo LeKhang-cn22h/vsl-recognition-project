@@ -1,0 +1,22 @@
+{
+  "model_type": "SVM_RBF",
+  "emotions": [
+    "angry",
+    "happy",
+    "surprise"
+  ],
+  "features": [
+    "left_ear",
+    "right_ear",
+    "avg_ear",
+    "mar",
+    "left_brow",
+    "right_brow",
+    "avg_brow",
+    "nose_chin_dist",
+    "eye_dist"
+  ],
+  "n_features": 9,
+  "model_file": "emotion_classifier.pkl",
+  "encoder_file": "emotion_label_encoder.pkl"
+}

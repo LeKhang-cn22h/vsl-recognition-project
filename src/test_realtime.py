@@ -207,7 +207,8 @@ class VSLTester:
         )
 
         # ---- Emotion detector ----
-        self.emotion_detector = FaceMeshEmotionDetector()
+        from ml_emotion_detector import MLEmotionDetector
+        self.emotion_detector = MLEmotionDetector()
 
         # ---- Prediction buffer (30 frames) ----
         self.buffer = deque(maxlen=30)
