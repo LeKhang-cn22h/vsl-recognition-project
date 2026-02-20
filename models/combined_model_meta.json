@@ -1,0 +1,12 @@
+{
+  "model_type": "dual_stream",
+  "labels": [
+    "khong_biet",
+    "yeu_thuong"
+  ],
+  "sequence_length": 30,
+  "n_hand_features": 126,
+  "n_face_features": 9,
+  "n_total_features": 135,
+  "test_accuracy": 1.0
+}
