@@ -4,8 +4,8 @@ COMBINED MODEL TRAINING SUMMARY
 
 Model                         Acc (%)        Loss    Time (s)
 ------------------------------------------------------------
-dual_stream                   100.00%      0.0002         8.4
-attention_bilstm               95.00%      0.2896        30.2
-simple_lstm                   100.00%      0.0001        18.0
+dual_stream                   100.00%      0.0000        22.3
+attention_bilstm               97.06%      0.2397        22.4
+simple_lstm                    97.06%      0.1011        11.4
 
 Best: dual_stream  Acc=100.00%

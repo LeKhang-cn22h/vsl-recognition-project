@@ -2,6 +2,8 @@
   "model_type": "dual_stream",
   "labels": [
     "khong_biet",
+    "nhập_khẩu",
+    "nổi_da_gà",
     "yeu_thuong"
   ],
   "sequence_length": 30,

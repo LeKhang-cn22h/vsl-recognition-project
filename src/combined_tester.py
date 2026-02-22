@@ -304,28 +304,28 @@ class CombinedTester:
         cv2.putText(frame, f"Buffer {buf}/{SEQUENCE_LENGTH}",
                     (bx+5, by+11), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
 
-        # ─ Meaning box (giữa màn hình) ─
-        if meaning:
-            (tw, th), _ = cv2.getTextSize(meaning, cv2.FONT_HERSHEY_SIMPLEX, 1.05, 2)
-            mx = W//2 - tw//2; my = H//2
-            cv2.rectangle(frame, (mx-15, my-th-12), (mx+tw+15, my+10), (0,0,0), -1)
-            cv2.rectangle(frame, (mx-15, my-th-12), (mx+tw+15, my+10), color, 2)
-            cv2.putText(frame, meaning, (mx, my),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.05, color, 2)
+        # # ─ Meaning box (giữa màn hình) ─
+        # if meaning:
+        #     (tw, th), _ = cv2.getTextSize(meaning, cv2.FONT_HERSHEY_SIMPLEX, 1.05, 2)
+        #     mx = W//2 - tw//2; my = H//2
+        #     cv2.rectangle(frame, (mx-15, my-th-12), (mx+tw+15, my+10), (0,0,0), -1)
+        #     cv2.rectangle(frame, (mx-15, my-th-12), (mx+tw+15, my+10), color, 2)
+        #     cv2.putText(frame, meaning, (mx, my),
+        #                 cv2.FONT_HERSHEY_SIMPLEX, 1.05, color, 2)
 
-        # ─ History ─
-        cv2.rectangle(frame, (0, H-120), (W, H), (0,0,0), -1)
-        cv2.putText(frame, "Lich su:", (10, H-102),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80,80,80), 1)
-        for i, past_sign, past_meaning in [
-            (i, *v) for i, v in enumerate(reversed(list(self._meaning_hist)))
-        ][:4]:
-            alpha = max(255 - i*55, 80)
-            pc = SIGN_COLORS.get(past_sign, (180,180,180))
-            cv2.putText(frame,
-                        f"{past_sign.upper().replace('_',' ')}: {past_meaning}",
-                        (10, H-82 + i*20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, pc, 1)
+        # # ─ History ─
+        # cv2.rectangle(frame, (0, H-120), (W, H), (0,0,0), -1)
+        # cv2.putText(frame, "Lich su:", (10, H-102),
+        #             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80,80,80), 1)
+        # for i, past_sign, past_meaning in [
+        #     (i, *v) for i, v in enumerate(reversed(list(self._meaning_hist)))
+        # ][:4]:
+        #     alpha = max(255 - i*55, 80)
+        #     pc = SIGN_COLORS.get(past_sign, (180,180,180))
+        #     cv2.putText(frame,
+        #                 f"{past_sign.upper().replace('_',' ')}: {past_meaning}",
+        #                 (10, H-82 + i*20),
+        #                 cv2.FONT_HERSHEY_SIMPLEX, 0.46, pc, 1)
 
         # ─ Controls hint ─
         cv2.putText(frame, "Q: thoat  C: xoa lich su  SPACE: reset buffer",
