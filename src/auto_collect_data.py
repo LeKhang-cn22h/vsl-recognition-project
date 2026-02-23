@@ -1,23 +1,20 @@
 """
 VSL Auto Collector Holistic from JSON - MediaPipe Task API
-Phiên bản "Super Augmentation Holistic v2"
+Super Augmentation Holistic v3
 
-FIXES:
-- [BUG FIX] normalize_keypoints: Vectorized numpy, dùng midpoint 2 vai thay vì mũi
-- [BUG FIX] process_single_video: Append norm_kps thay vì kps
-- [BUG FIX] extract_keypoints: Sắp xếp tay theo handedness (Left trước, Right sau)
+THAY ĐỔI CHÍNH:
+- [FIX CRITICAL] normalize_keypoints: Hierarchical normalization
+    * POSE  → tâm = midpoint 2 vai, scale = khoảng cách vai
+              Encode vị trí/tư thế cơ thể, bao gồm vị trí cổ tay (wrist position)
+    * HANDS → tâm = wrist của chính tay đó, scale = wrist→middle_mcp
+              Encode HÌNH DẠNG bàn tay độc lập với vị trí
+    Tại sao đúng hơn:
+    - Trước đây normalize tất cả về shoulder → hình dạng bàn tay thay đổi theo vị trí tay
+    - Cùng 1 nắm tay ở gần mặt vs gần ngực → 2 vector khác nhau → model học gấp đôi pattern
+    - Sau khi fix: hình dạng tay luôn nhất quán, vị trí tay encode qua Pose wrist landmarks
 
-AUGMENTATION (v2):
-- Speed Variation, Time Warping, Temporal Crop (temporal)
-- Shear/Skew, Joint Dropout (spatial)
-- Flip + Speed combination
-Tổng: ~35-40 file/từ
-
-LƯU Ý QUAN TRỌNG về Face Detector:
-- Vẫn giữ face detector ở đây để data lưu có đủ 1659 chiều (Pose+Face+Hands)
-- test_realtime_gcn.py bỏ face detector → dùng zeros thay thế cho phần face
-- Điều này OK vì train_gcn.py chỉ trích index 0:99 (Pose) và 1533:1659 (Hands)
-  không đụng đến phần face (99:1533) khi training
+AUGMENTATION v2 (giữ nguyên):
+    Speed, Time Warp, Temporal Crop, Shear, Joint Dropout, Flip+Speed
 """
 
 import cv2
@@ -36,6 +33,22 @@ except ImportError:
     SCIPY_AVAILABLE = False
     print("⚠️ scipy chưa cài. Time Warping bị bỏ qua. Cài: pip install scipy")
 
+# ==========================================
+# INDEX MAPPING trong vector flatten (553, 3)
+# Pose:  kps[0:33]
+# Face:  kps[33:511]   (478 điểm)
+# LHand: kps[511:532]  (21 điểm)
+# RHand: kps[532:553]  (21 điểm)
+# ==========================================
+POSE_START  = 0
+POSE_END    = 33
+FACE_START  = 33
+FACE_END    = 511
+LHAND_START = 511
+LHAND_END   = 532
+RHAND_START = 532
+RHAND_END   = 553
+
 
 class VSLAutoCollector:
     def __init__(self, json_path, output_dir='../data/raw'):
@@ -45,7 +58,7 @@ class VSLAutoCollector:
 
         os.makedirs(output_dir, exist_ok=True)
 
-        print("Initializing MediaPipe Holistic (Auto Collector)...")
+        print("Initializing MediaPipe Holistic (Auto Collector v3)...")
         self._setup_models()
         self._init_detectors()
 
@@ -58,17 +71,19 @@ class VSLAutoCollector:
         import urllib.request
         for name, url in models.items():
             if not os.path.exists(name):
-                print(f"Downloading {name}...")
+                print(f"  Downloading {name}...")
                 try:
                     urllib.request.urlretrieve(url, name)
                 except Exception as e:
-                    print(f"❌ Failed: {e}")
+                    print(f"  ❌ Failed: {e}")
 
     def _init_detectors(self):
         base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
         self.hand_detector = vision.HandLandmarker.create_from_options(
             vision.HandLandmarkerOptions(
-                base_options=base_options, num_hands=2, min_hand_detection_confidence=0.3))
+                base_options=base_options,
+                num_hands=2,
+                min_hand_detection_confidence=0.3))
 
         base_options = python.BaseOptions(model_asset_path='face_landmarker.task')
         self.face_detector = vision.FaceLandmarker.create_from_options(
@@ -78,32 +93,77 @@ class VSLAutoCollector:
         self.pose_detector = vision.PoseLandmarker.create_from_options(
             vision.PoseLandmarkerOptions(base_options=base_options))
 
-    # ==========================================
-    # NORMALIZE — vectorized
-    # ==========================================
+    # ============================================================
+    # NORMALIZE — Hierarchical (pose theo vai, tay theo wrist)
+    # ============================================================
     def normalize_keypoints(self, keypoints):
         """
-        Chuẩn hóa theo midpoint 2 vai — vectorized numpy.
-        Tâm  = (vai_trái + vai_phải) / 2
-        Scale = khoảng cách 2 vai
+        Hierarchical normalization:
+
+        POSE (kps[0:33]):
+            Tâm  = midpoint(vai_trái[11], vai_phải[12])
+            Scale = ||vai_trái - vai_phải||
+            → Encode vị trí tư thế, GIỮ vị trí cổ tay (wrist)
+              vì wrist trong Pose đã normalize = vị trí tay tương đối cơ thể
+
+        LEFT HAND (kps[511:532]):
+            Tâm  = wrist của tay trái (index 0 trong hand = kps[511])
+            Scale = ||wrist - middle_finger_mcp (index 9 = kps[511+9])||
+            → Encode HÌNH DẠNG bàn tay, bất biến với vị trí & khoảng cách camera
+
+        RIGHT HAND (kps[532:553]):
+            Tương tự Left Hand
+
+        Thông tin VỊ TRÍ tay được giữ qua Pose landmarks 15 (L_wrist), 16 (R_wrist)
+        đã được normalize theo vai → model biết tay ở đâu trên cơ thể.
         """
         kps = np.array(keypoints, dtype=np.float32).reshape(-1, 3)  # (553, 3)
 
-        left_shoulder  = kps[11].copy()
-        right_shoulder = kps[12].copy()
+        # ---- 1. POSE: normalize theo midpoint 2 vai ----
+        left_shoulder  = kps[11].copy()   # Pose landmark 11
+        right_shoulder = kps[12].copy()   # Pose landmark 12
 
-        if np.any(left_shoulder != 0) and np.any(right_shoulder != 0):
-            center        = (left_shoulder + right_shoulder) / 2.0
-            shoulder_dist = np.linalg.norm(left_shoulder - right_shoulder)
+        shoulder_ok   = np.any(left_shoulder != 0) and np.any(right_shoulder != 0)
+        shoulder_center = (left_shoulder + right_shoulder) / 2.0
+        shoulder_dist   = np.linalg.norm(left_shoulder - right_shoulder)
 
-            if shoulder_dist > 1e-6:
-                detected_mask      = np.any(kps != 0, axis=1)
-                kps[detected_mask] = (kps[detected_mask] - center) / shoulder_dist
+        if shoulder_ok and shoulder_dist > 1e-6:
+            detected_pose = np.any(kps[POSE_START:POSE_END] != 0, axis=1)
+            idxs = np.where(detected_pose)[0] + POSE_START
+            kps[idxs] = (kps[idxs] - shoulder_center) / shoulder_dist
+        
+        # Fallback scale nếu không detect được vai
+        fallback_scale = shoulder_dist if (shoulder_ok and shoulder_dist > 1e-6) else 0.3
+
+        # ---- 2. LEFT HAND: normalize theo wrist trái ----
+        left_wrist = kps[LHAND_START].copy()   # index 0 của hand = wrist
+        if np.any(left_wrist != 0):
+            left_mid_mcp = kps[LHAND_START + 9].copy()   # index 9 = middle finger MCP
+            hand_scale   = np.linalg.norm(left_wrist - left_mid_mcp)
+            hand_scale   = hand_scale if hand_scale > 1e-6 else fallback_scale * 0.3
+
+            detected_lh = np.any(kps[LHAND_START:LHAND_END] != 0, axis=1)
+            idxs = np.where(detected_lh)[0] + LHAND_START
+            kps[idxs] = (kps[idxs] - left_wrist) / hand_scale
+
+        # ---- 3. RIGHT HAND: normalize theo wrist phải ----
+        right_wrist = kps[RHAND_START].copy()
+        if np.any(right_wrist != 0):
+            right_mid_mcp = kps[RHAND_START + 9].copy()
+            hand_scale    = np.linalg.norm(right_wrist - right_mid_mcp)
+            hand_scale    = hand_scale if hand_scale > 1e-6 else fallback_scale * 0.3
+
+            detected_rh = np.any(kps[RHAND_START:RHAND_END] != 0, axis=1)
+            idxs = np.where(detected_rh)[0] + RHAND_START
+            kps[idxs] = (kps[idxs] - right_wrist) / hand_scale
 
         return kps.flatten()
 
     def extract_keypoints(self, hand_result, face_result, pose_result):
-        """Extract: Pose(99) + Face(1434) + Hands(126) = 1659"""
+        """
+        Extract: Pose(99) + Face(1434) + LHand(63) + RHand(63) = 1659
+        Tay được sắp xếp Left/Right nhất quán qua handedness.
+        """
         keypoints = []
 
         # 1. Pose (33 * 3 = 99)
@@ -120,7 +180,7 @@ class VSLAutoCollector:
         else:
             keypoints.extend([0.0] * 1434)
 
-        # 3. Hands: LEFT trước, RIGHT sau
+        # 3. Hands: LEFT slot trước (63), RIGHT slot sau (63)
         left_hand  = [0.0] * 63
         right_hand = [0.0] * 63
 
@@ -129,7 +189,7 @@ class VSLAutoCollector:
                 hand_kps = []
                 for lm in hand_landmarks:
                     hand_kps.extend([lm.x, lm.y, lm.z])
-                label = hand_result.handedness[i][0].category_name
+                label = hand_result.handedness[i][0].category_name  # "Left"/"Right"
                 if label == "Left":
                     left_hand = hand_kps
                 else:
@@ -153,31 +213,28 @@ class VSLAutoCollector:
         result  = []
         for i in indices:
             low    = int(math.floor(i))
-            high   = int(math.ceil(i))
+            high   = min(int(math.ceil(i)), length - 1)
             weight = i - low
-            if high >= length:
-                result.append(sequence[length - 1])
-            else:
-                result.append(sequence[low] * (1 - weight) + sequence[high] * weight)
+            result.append(sequence[low] * (1 - weight) + sequence[high] * weight)
         return np.array(result, dtype=np.float32)
 
     # ==========================================
     # SPATIAL AUGMENTATION
     # ==========================================
     def apply_rotation(self, data_reshaped, angle):
-        rad            = np.radians(angle)
-        cos_a, sin_a   = np.cos(rad), np.sin(rad)
-        rot            = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
-        result         = data_reshaped.copy()
+        rad   = np.radians(angle)
+        cos_a, sin_a = np.cos(rad), np.sin(rad)
+        rot   = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+        result = data_reshaped.copy()
         result[:, :, :2] = np.dot(result[:, :, :2], rot)
         return result.reshape(self.sequence_length, -1)
 
     def apply_shear(self, data_reshaped, shear_x=0.0, shear_y=0.0):
-        result         = data_reshaped.copy()
-        orig_x         = data_reshaped[:, :, 0].copy()
-        orig_y         = data_reshaped[:, :, 1].copy()
-        result[:, :, 0] = orig_x + shear_x * orig_y
-        result[:, :, 1] = orig_y + shear_y * orig_x
+        result = data_reshaped.copy()
+        ox = data_reshaped[:, :, 0].copy()
+        oy = data_reshaped[:, :, 1].copy()
+        result[:, :, 0] = ox + shear_x * oy
+        result[:, :, 1] = oy + shear_y * ox
         return result.reshape(self.sequence_length, -1)
 
     def apply_joint_dropout(self, data_reshaped, dropout_rate=0.08, seed=None):
@@ -215,7 +272,6 @@ class VSLAutoCollector:
         warped    = np.clip(warped, 0, T - 1)
         warped[0]  = 0
         warped[-1] = T - 1
-
         for k in range(1, len(warped)):
             warped[k] = max(warped[k], warped[k - 1] + 0.5)
         warped = np.clip(warped, 0, T - 1)
@@ -229,7 +285,6 @@ class VSLAutoCollector:
             high   = min(int(np.ceil(i)), T - 1)
             weight = i - low
             result.append(base_data[low] * (1 - weight) + base_data[high] * weight)
-
         return self.resample_sequence(np.array(result, dtype=np.float32), self.sequence_length)
 
     def apply_temporal_crops(self, raw_sequence, n_crops=3):
@@ -266,7 +321,7 @@ class VSLAutoCollector:
             else:
                 data_to_process = video_list[:limit]
 
-            print(f"✅ Tìm thấy {len(data_to_process)} video.")
+            print(f"✅ Tìm thấy {len(data_to_process)} video. Bắt đầu xử lý...")
 
             for index, item in enumerate(data_to_process):
                 gloss = item.get('gross')
@@ -278,8 +333,7 @@ class VSLAutoCollector:
 
         except Exception as e:
             print(f"Lỗi JSON: {e}")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
 
     def process_single_video(self, sign_name, video_url):
         cap = cv2.VideoCapture(video_url)
@@ -288,12 +342,10 @@ class VSLAutoCollector:
             return
 
         raw_sequence = []
-
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-
             rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
@@ -315,7 +367,7 @@ class VSLAutoCollector:
         self.generate_augmentations(sign_name, raw_sequence)
 
     # ==========================================
-    # AUGMENTATION ENGINE v2
+    # AUGMENTATION ENGINE v3
     # ==========================================
     def generate_augmentations(self, sign_name, raw_sequence):
         save_path = os.path.join(self.output_dir, sign_name)
@@ -347,12 +399,14 @@ class VSLAutoCollector:
             augmentations.append((f"shift{idx}", temp.reshape(self.sequence_length, -1)))
 
         # NHÓM 5: SHEAR (4)
-        for sx, sy, name in [(0.10, 0, "shx+"), (-0.10, 0, "shx-"), (0, 0.10, "shy+"), (0, -0.10, "shy-")]:
+        for sx, sy, name in [(0.10, 0, "shx+"), (-0.10, 0, "shx-"),
+                              (0, 0.10, "shy+"), (0, -0.10, "shy-")]:
             augmentations.append((f"shear_{name}", self.apply_shear(base_reshape, sx, sy)))
 
         # NHÓM 6: JOINT DROPOUT (3)
         for i in range(3):
-            augmentations.append((f"dropout{i}", self.apply_joint_dropout(base_reshape, 0.08, seed=i * 7)))
+            augmentations.append((f"dropout{i}",
+                self.apply_joint_dropout(base_reshape, 0.08, seed=i * 7)))
 
         # NHÓM 7: SPEED (4)
         for speed in [0.70, 0.85, 1.15, 1.30]:

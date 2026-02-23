@@ -1,15 +1,10 @@
 """
-VSL Graph Convolutional Network (GCN) Trainer
-Kiến trúc ST-GCN (Spatio-Temporal Graph Convolutional Networks)
+VSL ST-GCN + GRU Trainer
 
-FIXES:
-- [BUG FIX] load_data_gcn: BỎ normalize vì data từ collect ĐÃ normalized rồi
-            Normalize 2 lần → train/test distribution lệch hoàn toàn
-- [BUG FIX] STGCN_Block: layers.Add() khởi tạo trong __init__, không phải call()
-            Tạo layer mới mỗi forward pass → weights không được track đúng
-- [BUG FIX] GraphConv: identity init + softmax normalize thay vì uniform
-            Uniform random → gradient bất ổn lúc đầu train
-- [IMPROVE] L2 regularization trên Dense cuối để tránh overfit với ít data
+FIX:
+- [FIX] Thay Lambda layer bằng NodePool custom layer
+        Lambda bị Keras chặn khi load vì lý do bảo mật (arbitrary code execution)
+        Custom layer với get_config() → load/save an toàn, không cần safe_mode=False
 """
 
 import numpy as np
@@ -29,24 +24,14 @@ import matplotlib.pyplot as plt
 # ==========================================
 def load_data_gcn(dataset_dir):
     """
-    Load data cho GCN.
-    Pipeline: file .npy (30, 1659) → trích 75 điểm → (30, 75, 3)
-
-    KHÔNG normalize ở đây — auto_collect_data.py đã normalize khi lưu.
-    Normalize 2 lần làm lệch hoàn toàn với test (chỉ normalize 1 lần).
-
-    75 điểm = Pose(33) + Left Hand(21) + Right Hand(21)
-    Index trong vector 1659:
-      - Pose:       0   → 98   (33*3)
-      - Face:       99  → 1532 (478*3 — bỏ qua)
-      - Left Hand:  1533→ 1595 (21*3)
-      - Right Hand: 1596→ 1658 (21*3)
+    Load: file .npy (30, 1659) → trích 75 điểm → (30, 75, 3)
+    KHÔNG normalize — data đã normalize hierarchical từ collect.
     """
-    X, y = [], []
-    folders = [f for f in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, f))]
+    X, y    = [], []
+    folders = [f for f in os.listdir(dataset_dir)
+               if os.path.isdir(os.path.join(dataset_dir, f))]
 
     print(f"🔍 Tìm thấy {len(folders)} class: {sorted(folders)}")
-    print("📂 Đang tải dữ liệu...")
 
     for sign_name in sorted(folders):
         sign_path = os.path.join(dataset_dir, sign_name)
@@ -55,23 +40,19 @@ def load_data_gcn(dataset_dir):
 
         for f in files:
             try:
-                seq = np.load(f)  # (30, 1659) — đã normalized từ collect
-
+                seq = np.load(f)
                 if seq.shape != (30, 1659):
                     continue
 
-                # Trích 75 điểm: Pose + 2 tay
-                pose  = seq[:, 0:99]       # (30, 99)
-                hands = seq[:, 1533:1659]  # (30, 126)
+                pose     = seq[:, 0:99]
+                hands    = seq[:, 1533:1659]
+                skeleton = np.concatenate([pose, hands], axis=1)
 
-                skeleton          = np.concatenate([pose, hands], axis=1)  # (30, 225)
-                skeleton_reshaped = skeleton.reshape(30, 75, 3)            # (30, 75, 3)
-
-                X.append(skeleton_reshaped)
+                X.append(skeleton.reshape(30, 75, 3))
                 y.append(sign_name)
                 count += 1
             except Exception as e:
-                print(f"  ⚠️ Lỗi đọc {os.path.basename(f)}: {e}")
+                print(f"  ⚠️ Lỗi {os.path.basename(f)}: {e}")
 
         print(f"  ✓ {sign_name}: {count} samples")
 
@@ -79,21 +60,10 @@ def load_data_gcn(dataset_dir):
 
 
 # ==========================================
-# MÔ HÌNH GCN
+# CUSTOM LAYERS
 # ==========================================
 class GraphConv(layers.Layer):
-    """
-    GCN với Adaptive Adjacency Matrix.
-
-    Fix identity init:
-    - Bắt đầu từ self-connection (mỗi node chỉ kết nối chính nó)
-    - Dần học thêm kết nối với node lân cận
-    - Uniform ngẫu nhiên 0-1 → gradient bất ổn ngay từ đầu
-
-    Fix softmax normalize:
-    - Đảm bảo tổng trọng số kết nối = 1 cho mỗi node
-    - Ổn định gradient trong suốt quá trình train
-    """
+    """GCN với Adaptive Adjacency Matrix (identity init + softmax normalize)."""
     def __init__(self, out_channels, **kwargs):
         super().__init__(**kwargs)
         self.out_channels = out_channels
@@ -106,11 +76,10 @@ class GraphConv(layers.Layer):
     def build(self, input_shape):
         self.nodes       = input_shape[2]
         self.in_channels = input_shape[3]
-
         self.A = self.add_weight(
             name="adjacency_matrix",
             shape=(self.nodes, self.nodes),
-            initializer="identity",                    # ← Fix: identity thay vì uniform
+            initializer="identity",
             regularizer=keras.regularizers.l2(0.001),
             trainable=True
         )
@@ -122,37 +91,25 @@ class GraphConv(layers.Layer):
         )
 
     def call(self, inputs):
-        # Normalize A bằng softmax để tổng trọng số mỗi node = 1
-        A_norm = tf.nn.softmax(self.A, axis=-1)        # ← Fix: normalize A
-
-        # Graph conv: (V,V) x (B,T,V,C) -> (B,T,V,C)
+        A_norm = tf.nn.softmax(self.A, axis=-1)
         x = tf.einsum('vw,btwc->btvc', A_norm, inputs)
-
-        # Linear transform
         x = tf.matmul(x, self.W)
         return tf.nn.relu(x)
 
 
 class STGCN_Block(layers.Layer):
-    """
-    Khối ST-GCN: GCN (spatial) + TCN (temporal) + Residual.
-
-    Fix layers.Add():
-    - Phải khởi tạo trong __init__, không phải call()
-    - Nếu init trong call() → mỗi forward pass tạo Add layer mới
-      → weights không được track → residual connection không học được
-    """
+    """ST-GCN Block: GCN (spatial) + Conv2D (temporal) + Residual."""
     def __init__(self, out_channels, dropout=0.3, **kwargs):
         super().__init__(**kwargs)
         self.out_channels = out_channels
         self.dropout_rate = dropout
-
         self.gcn        = GraphConv(out_channels)
-        self.tcn        = layers.Conv2D(out_channels, kernel_size=(9, 1), padding='same', activation='relu')
+        self.tcn        = layers.Conv2D(out_channels, kernel_size=(9, 1),
+                                        padding='same', activation='relu')
         self.dropout    = layers.Dropout(dropout)
         self.batch_norm = layers.BatchNormalization()
         self.residual   = layers.Conv2D(out_channels, kernel_size=(1, 1), padding='same')
-        self.add        = layers.Add()  # ← Fix: khởi tạo 1 lần ở đây
+        self.add        = layers.Add()
 
     def get_config(self):
         config = super().get_config()
@@ -165,11 +122,43 @@ class STGCN_Block(layers.Layer):
         x   = self.batch_norm(x, training=training)
         x   = self.dropout(x, training=training)
         res = self.residual(inputs)
-        return self.add([x, res])  # ← Dùng self.add đã khởi tạo sẵn
+        return self.add([x, res])
 
 
+class NodePool(layers.Layer):
+    """
+    Pool theo chiều Node (axis=2), GIỮ chiều Time.
+    (B, T, V, C) → (B, T, C) bằng mean theo V.
+
+    Thay thế Lambda layer để tránh lỗi Keras security:
+    'Requested the deserialization of a Lambda layer... disallowed by default'
+    Custom layer có get_config() → serialize/deserialize an toàn.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def get_config(self):
+        return super().get_config()
+
+    def call(self, inputs):
+        # inputs: (B, T, V, C) → output: (B, T, C)
+        return tf.reduce_mean(inputs, axis=2)
+
+
+# ==========================================
+# MODEL
+# ==========================================
 def build_st_gcn_model(input_shape, num_classes):
-    inputs = layers.Input(shape=input_shape)  # (30, 75, 3)
+    """
+    Pipeline:
+      (B, 30, 75, 3)
+        → BatchNorm
+        → STGCN x5        → (B, 30, 75, 256)
+        → NodePool         → (B, 30, 256)      [mean theo node, GIỮ time]
+        → GRU(128)         → (B, 128)           [học temporal order]
+        → Dropout → Dense  → (B, num_classes)
+    """
+    inputs = layers.Input(shape=input_shape)
 
     x = layers.BatchNormalization()(inputs)
 
@@ -178,16 +167,23 @@ def build_st_gcn_model(input_shape, num_classes):
     x = STGCN_Block(128, name="stgcn_3")(x)
     x = STGCN_Block(128, name="stgcn_4")(x)
     x = STGCN_Block(256, name="stgcn_5")(x)
+    # (B, 30, 75, 256)
 
-    x = layers.GlobalAveragePooling2D()(x)
+    x = NodePool(name="node_pool")(x)
+    # (B, 30, 256)
+
+    x = layers.GRU(128, return_sequences=False, name="temporal_gru")(x)
+    # (B, 128)
+
     x = layers.Dropout(0.4)(x)
     outputs = layers.Dense(
         num_classes,
         activation='softmax',
-        kernel_regularizer=keras.regularizers.l2(0.01)  # Tránh overfit với ít data
+        kernel_regularizer=keras.regularizers.l2(0.01),
+        name="classifier"
     )(x)
 
-    model = keras.Model(inputs=inputs, outputs=outputs, name="VSL_ST_GCN")
+    model = keras.Model(inputs=inputs, outputs=outputs, name="VSL_STGCN_GRU")
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=1e-3),
         loss='sparse_categorical_crossentropy',
@@ -197,7 +193,7 @@ def build_st_gcn_model(input_shape, num_classes):
 
 
 # ==========================================
-# HUẤN LUYỆN
+# TRAINING
 # ==========================================
 def main():
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -207,73 +203,64 @@ def main():
     os.makedirs(models_dir,  exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
 
-    # 1. Load Data
     X, y = load_data_gcn(dataset_dir)
-
     if len(X) == 0:
-        print("❌ Không tìm thấy dữ liệu hợp lệ!")
+        print("❌ Không tìm thấy dữ liệu!")
         return
+    print(f"\n✅ Data shape: {X.shape}")
 
-    print(f"\n✅ Data shape: {X.shape}")  # (N, 30, 75, 3)
-
-    # 2. Encode Labels
     le      = LabelEncoder()
     y_enc   = le.fit_transform(y)
     classes = le.classes_
     print(f"🏷️  Classes ({len(classes)}): {classes}")
 
-    # 3. Split
     X_train, X_test, y_train, y_test = train_test_split(
         X, y_enc, test_size=0.2, random_state=42, stratify=y_enc
     )
     print(f"📊 Train: {len(X_train)} | Test: {len(X_test)}")
 
-    # 4. Model
     model = build_st_gcn_model(input_shape=(30, 75, 3), num_classes=len(classes))
     model.summary()
 
-    # 5. Train
-    print("\n🚀 Bắt đầu huấn luyện...")
-    checkpoint = keras.callbacks.ModelCheckpoint(
-        os.path.join(models_dir, 'best_gcn_model.h5'),
-        save_best_only=True, monitor='val_accuracy', verbose=1
-    )
-    early_stop = keras.callbacks.EarlyStopping(
-        monitor='val_loss', patience=25, restore_best_weights=True
-    )
-    reduce_lr = keras.callbacks.ReduceLROnPlateau(
-        monitor='val_loss', factor=0.5, patience=10, min_lr=1e-6, verbose=1
-    )
+    print("\n🚀 Bắt đầu huấn luyện ST-GCN + GRU...")
+    model_save_path = os.path.join(models_dir, 'best_gcn_model.h5')
+
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(
+            model_save_path, save_best_only=True,
+            monitor='val_accuracy', verbose=1
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor='val_loss', patience=25, restore_best_weights=True
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', factor=0.5, patience=10,
+            min_lr=1e-6, verbose=1
+        ),
+    ]
 
     history = model.fit(
         X_train, y_train,
         validation_data=(X_test, y_test),
         epochs=200,
         batch_size=16,
-        callbacks=[checkpoint, early_stop, reduce_lr]
+        callbacks=callbacks
     )
 
-    # 6. Evaluate
-    print("\n📊 Đánh giá mô hình...")
+    print("\n📊 Đánh giá...")
     y_pred = np.argmax(model.predict(X_test), axis=1)
     print(classification_report(y_test, y_pred, target_names=classes))
 
-    # 7. Save
     np.save(os.path.join(models_dir, 'label_encoder_gcn.npy'), classes)
     print("✅ Đã lưu label encoder.")
 
-    # 8. Plot
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(history.history['accuracy'],     label='Train')
-    plt.plot(history.history['val_accuracy'], label='Val')
-    plt.title('Accuracy'); plt.legend()
-
-    plt.subplot(1, 2, 2)
-    plt.plot(history.history['loss'],     label='Train')
-    plt.plot(history.history['val_loss'], label='Val')
-    plt.title('Loss'); plt.legend()
-
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    ax1.plot(history.history['accuracy'],     label='Train')
+    ax1.plot(history.history['val_accuracy'], label='Val')
+    ax1.set_title('Accuracy'); ax1.legend()
+    ax2.plot(history.history['loss'],     label='Train')
+    ax2.plot(history.history['val_loss'], label='Val')
+    ax2.set_title('Loss'); ax2.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(results_dir, 'gcn_training_history.png'))
     print("✅ Đã lưu biểu đồ.")
