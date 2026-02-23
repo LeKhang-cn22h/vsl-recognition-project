@@ -16,8 +16,6 @@ Tính năng:
   - Tự động upload lên HuggingFace sau mỗi video
   - Tự động lưu metadata
 
-Cài đặt:
-    pip install mediapipe opencv-python numpy python-dotenv huggingface_hub
 
 Cấu hình HuggingFace (tạo file .env):
     HF_TOKEN=hf_xxxxxxxxxxxxxx

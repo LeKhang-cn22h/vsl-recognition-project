@@ -114,7 +114,6 @@ class VSLDataCollector:
         return keypoints
     
     def normalize_keypoints(self, keypoints):
-<<<<<<< HEAD
         """
         Normalize keypoints.
         Structure: [Pose(99) | Face(1434) | Hands(126)]
@@ -125,30 +124,6 @@ class VSLDataCollector:
         return keypoints # Returning flattened list
     
     def draw_landmarks(self, frame, hand_result, face_result, pose_result):
-=======
-        """chuẩn hóa cị trí không phụ thuộc camera gần xa"""
-        # chuyển từ 126 thành 3 cột mảng (xyz)
-        keypoints = np.array(keypoints).reshape(-1, 3)
-        
-        for hand_idx in range(2):
-            start_idx = hand_idx * 21
-            end_idx = start_idx + 21
-            hand_kps = keypoints[start_idx:end_idx]
-            
-            if np.sum(hand_kps) != 0:
-                # lấy cổ tay làm mốc trung tâm
-                wrist = hand_kps[0].copy()
-                hand_kps = hand_kps - wrist
-                keypoints[start_idx:end_idx] = hand_kps
-        # trải thành ma trận thành dạng 1 chiều 
-        return keypoints.flatten().tolist()
-    
-    def draw_landmarks(self, frame, detection_result):
-        """vẽ chấm và xương lên UI"""
-        if not detection_result.hand_landmarks:
-            return frame
-        
->>>>>>> 4ce1a779addc98c8948f65355f0cae9c247ac490
         h, w, _ = frame.shape
         
         # Draw Pose
@@ -177,11 +152,7 @@ class VSLDataCollector:
         if not cap.isOpened():
             print("Cannot open camera!")
             return 0
-<<<<<<< HEAD
             
-=======
-        # lưu file
->>>>>>> 4ce1a779addc98c8948f65355f0cae9c247ac490
         sign_dir = os.path.join(self.output_dir, sign_name)
         os.makedirs(sign_dir, exist_ok=True)
         
@@ -189,22 +160,9 @@ class VSLDataCollector:
         recording = False
         sequence = []
         
-<<<<<<< HEAD
         print(f"\nCollecting: {sign_name.upper()} | Target: {num_samples}")
         print("Press 'S' to Start | 'Q' to Quit")
         
-=======
-        print(f"\n{'='*60}")
-        print(f"Collecting: {sign_name.upper()}")
-        print(f"Target: {num_samples} samples")
-        print(f"{'='*60}")
-        print("\nInstructions:")
-        print("- Press 'S' to START recording")
-        print("- Perform the sign for 1 second")
-        print("- Press 'Q' to QUIT")
-        print(f"- Progress: {sample_count}/{num_samples}\n")
-        # mỗi vòng 1 frame webcam
->>>>>>> 4ce1a779addc98c8948f65355f0cae9c247ac490
         while sample_count < num_samples:
             ret, frame = cap.read()
             if not ret: break
@@ -234,23 +192,12 @@ class VSLDataCollector:
 
             # Collection Logic
             if recording:
-<<<<<<< HEAD
                 keypoints = self.extract_keypoints(hand_result, face_result, pose_result)
                 sequence.append(keypoints)
                 
                 if len(sequence) >= sequence_length:
                     save_path = os.path.join(sign_dir, f"{sign_name}_{int(time.time())}.npy")
                     np.save(save_path, np.array(sequence))
-=======
-                keypoints = self.extract_keypoints(detection_result)# Trích xuất tọa độ thô (126 số)
-                keypoints = self.normalize_keypoints(keypoints)# Chuẩn hóa về gốc (0,0,0)
-                sequence.append(keypoints)# Thêm tọa độ frame này vào giỏ.
-                
-                if len(sequence) >= sequence_length:
-                    sample_path = os.path.join(sign_dir, f'sample_{sample_count:03d}.npy')
-                    np.save(sample_path, np.array(sequence))# Lưu thành file nhị phân .npy để máy học sau này.
-                    
->>>>>>> 4ce1a779addc98c8948f65355f0cae9c247ac490
                     sample_count += 1
                     sequence = []
                     recording = False
