@@ -937,7 +937,7 @@ def main():
         use_hf = (use_hf != 'n')
     else:
         print("  Khong tim thay HF_REPO_ID trong .env")
-        hf_repo = input("  Nhap Repo ID (vd: KhangCN/Video_VSL) hoac Enter de bo qua: ").strip()
+        hf_repo = input("  Nhap Repo ID hoac Enter de bo qua: ").strip()
         if hf_repo:
             hf_token = input("  Nhap HF Token (Enter neu repo public): ").strip() or None
             use_hf   = True
