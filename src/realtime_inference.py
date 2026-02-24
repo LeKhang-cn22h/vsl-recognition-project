@@ -111,6 +111,10 @@ if os.path.exists(display_path):
 def get_display_name(label_key):
     """Chuyển label_key → tên tiếng Việt, fallback về key nếu chưa có"""
     return display_names.get(label_key, label_key)
+
+def is_idle_label(label):
+    """Kiểm tra label có phải IDLE không"""
+    return label.startswith('__idle__')
 # ═══════════════════════════════════════════════════════════
 # DUAL TRANSFORMER MODEL (copy từ train để standalone)
 # ═══════════════════════════════════════════════════════════
@@ -632,12 +636,41 @@ class InferenceEngine:
 
         # Buffer frames
         self.frame_buffer = deque(maxlen=seq_len)
+        # Consecutive state
+        self.consecutive_count  = 0
+        self.consecutive_label  = None   # label đang theo dõi
+        self.last_confirmed     = None   # label đã xác nhận gần nhất
+        self.CONSEC_THRESHOLD   = 3      # cần 3 lần liên tiếp
+        # Motion Detection state
+        self.prev_features      = None
+        self.MOTION_THRESHOLD   = 0.015  # tune sau khi test
+        
 
         # Smoothing: trung bình xác suất qua nhiều lần inference
         self.prob_history  = deque(maxlen=smooth_window)
         self.last_result   = None
         self.last_time     = 0
+        self._just_confirmed = None
 
+    def compute_motion(self, curr_features):
+        """Tính mức độ di chuyển tay so với frame trước"""
+        if self.prev_features is None:
+            self.prev_features = curr_features.copy()
+            return 0.0
+
+        # Cổ tay phải: index 165,166 (x,y)
+        # Cổ tay trái: index 228,229 (x,y)
+        r_curr = curr_features[165:167]
+        r_prev = self.prev_features[165:167]
+        l_curr = curr_features[228:230]
+        l_prev = self.prev_features[228:230]
+
+        v_right = np.linalg.norm(r_curr - r_prev)
+        v_left  = np.linalg.norm(l_curr - l_prev)
+
+        self.prev_features = curr_features.copy()
+        return max(v_right, v_left)
+    
     def push_frame(self, feature_vec):
         self.frame_buffer.append(feature_vec)
 
@@ -645,31 +678,70 @@ class InferenceEngine:
     def buffer_ready(self):
         return len(self.frame_buffer) >= self.seq_len
 
-    def predict(self):
-        """Chạy inference và trả về top_k predictions"""
+    def predict(self, curr_features=None):
+        """Chạy inference + consecutive filter"""
         if not self.buffer_ready:
             return None
 
-        # Lấy seq_len frames gần nhất
-        seq = np.stack(list(self.frame_buffer)[-self.seq_len:])  # (T, D)
-        x   = torch.from_numpy(seq).unsqueeze(0).to(self.device)  # (1,T,D)
+        # ── Tầng 1: Motion Check ──
+        motion = 0.0
+        if curr_features is not None:
+            motion = self.compute_motion(curr_features)
+
+        if motion < self.MOTION_THRESHOLD and curr_features is not None:
+            # IDLE — reset consecutive, không predict
+            self.consecutive_count = 0
+            self.consecutive_label = None
+            return None   # trả None = đang nghỉ
+
+        # ── Tầng 2: Model Predict (code hiện tại) ──
+        seq   = np.stack(list(self.frame_buffer)[-self.seq_len:])
+        x     = torch.from_numpy(seq).unsqueeze(0).to(self.device)
 
         self.model.eval()
         with torch.no_grad():
             logits = self.model(x)
             probs  = Func.softmax(logits, dim=-1).cpu().numpy()[0]
 
-        # Smoothing: trung bình prob qua smooth_window lần
         self.prob_history.append(probs)
         smooth_probs = np.mean(self.prob_history, axis=0)
 
-        # Top-K
-        top_idx  = np.argsort(smooth_probs)[::-1][:self.top_k]
+        top_idx   = np.argsort(smooth_probs)[::-1][:self.top_k]
         top_preds = [(self.idx2label.get(i, f'cls_{i}'),
-                       float(smooth_probs[i]))
-                      for i in top_idx]
+                      float(smooth_probs[i])) for i in top_idx]
 
         self.last_result = top_preds
+
+        # ── Tầng 3: Confidence Check ──
+        top_label, top_conf = top_preds[0]
+        if top_conf < self.confidence_thr:
+            self.consecutive_count = 0
+            self.consecutive_label = None
+            return top_preds   # vẫn hiển thị UI nhưng chưa xác nhận
+        if is_idle_label(top_label):
+            self.consecutive_count = 0
+            self.consecutive_label = None
+            self.last_confirmed    = None   # reset để từ cũ có thể ký lại
+            return None   # bỏ qua hoàn toàn
+
+        # ── Tầng 4: Consecutive Check ──
+        if top_label == self.consecutive_label:
+            self.consecutive_count += 1
+        else:
+            self.consecutive_label = top_label
+            self.consecutive_count = 1
+
+        # ── Tầng 5: Xác nhận ──
+        if (self.consecutive_count >= self.CONSEC_THRESHOLD and
+                top_label != self.last_confirmed):
+            self.last_confirmed    = top_label
+            self.consecutive_count = 0   # reset để sẵn sàng từ tiếp theo
+            # Đánh dấu đây là từ mới được xác nhận
+            top_preds[0] = (top_label, top_conf)
+            self._just_confirmed = top_label   # signal ra ngoài
+        else:
+            self._just_confirmed = None
+
         return top_preds
 
 
@@ -717,9 +789,6 @@ class RealtimeApp:
         # ── State ──
         self.history         = deque(maxlen=50)
         self.paused          = False
-        self.last_confirmed  = None
-        self.confirm_counter = 0
-        self.CONFIRM_FRAMES  = 8   # cần N frame liên tục cùng kết quả mới log
 
         # FPS
         self._fps_buf = deque(maxlen=30)
@@ -732,29 +801,6 @@ class RealtimeApp:
         self._fps_buf.append(1.0 / max(now - self._t_prev, 1e-6))
         self._t_prev = now
         return np.mean(self._fps_buf)
-
-    def _maybe_log(self, top_preds):
-        """Chỉ ghi vào history khi kết quả ổn định nhiều frame"""
-        if not top_preds:
-            self.confirm_counter = 0
-            return
-
-        top_label, top_prob = top_preds[0]
-        if top_prob < self.confidence_thr:
-            self.confirm_counter = 0
-            return
-
-        if top_label == self.last_confirmed:
-            self.confirm_counter += 1
-        else:
-            self.confirm_counter = 1
-            self.last_confirmed  = top_label
-
-        # Ghi khi đạt ngưỡng confirm
-        if self.confirm_counter == self.CONFIRM_FRAMES:
-            ts = datetime.now().strftime('%H:%M:%S')
-            self.history.append((ts, top_label, top_prob))
-            print(f"  [{ts}] Detected: {top_label}  ({top_prob*100:.1f}%)")
 
     def run(self):
         cap = cv2.VideoCapture(0)
@@ -790,10 +836,15 @@ class RealtimeApp:
                 self.engine.push_frame(feats)
 
                 # Chạy inference
-                top_preds = self.engine.predict()
+                top_preds = self.engine.predict(curr_features=feats)
 
                 # Ghi history
-                self._maybe_log(top_preds)
+                if self.engine._just_confirmed:
+                    confirmed_label = self.engine._just_confirmed
+                    ts = datetime.now().strftime('%H:%M:%S')
+                    conf = top_preds[0][1] if top_preds else 0.0
+                    self.history.append((ts, confirmed_label, conf))
+                    print(f"  [{ts}] Detected: {get_display_name(confirmed_label)}  ({conf*100:.1f}%)")   
             else:
                 top_preds = self.engine.last_result
 
@@ -827,8 +878,11 @@ class RealtimeApp:
                 self.history.clear()
                 self.engine.frame_buffer.clear()
                 self.engine.prob_history.clear()
-                self.confirm_counter = 0
-                self.last_confirmed  = None
+                self.engine.consecutive_count  = 0
+                self.engine.consecutive_label  = None
+                self.engine.last_confirmed     = None
+                self.engine._just_confirmed    = None
+                self.engine.prev_features      = None
                 print("  History cleared")
 
             elif key == ord('s') or key == ord('S'):
