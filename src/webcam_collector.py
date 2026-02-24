@@ -1298,10 +1298,12 @@ class WebcamVideoCollectorFull:
             print("\n  1. Xem thong ke video")
             print("  2. Tao nhan moi va thu video")
             print("  3. Tiep tuc thu video cho nhan co san")
-            print("  4. Luu va thoat")
+            print("  4. Thu video IDLE (nghi / khong ky hieu)")
+            print("  5. Luu va thoat")
+            
             print("\n" + "="*60)
 
-            ch = input("\n Chon chuc nang (1-4): ").strip()
+            ch = input("\n Chon chuc nang (1-5): ").strip()
 
             if ch == "1":
                 self.show_statistics()
@@ -1358,6 +1360,80 @@ class WebcamVideoCollectorFull:
                 except ValueError:
                     print(" Vui long nhap so!")
             elif ch == "4":
+                idle_actions = [
+                    ("tay_xuoi_hong",     "Tay xuoi ben hong dung yen"),
+                    ("tay_khoanh_nguc",   "Tay khoanh truoc nguc"),
+                    ("tay_tren_ban",      "Tay dat tren ban"),
+                    ("ga_dau",            "Ga dau / chinh toc"),
+                    ("dua_tay_len_xuong", "Dua tay len roi ha xuong khong ky"),
+                    ("vuon_vai",          "Vuon vai / doi tu the"),
+                    ("dung_xa",           "Dung xa camera"),
+                    ("dung_gan",          "Dung gan camera"),
+                    ("nghieng_nguoi",     "Nghieng nguoi sang trai phai"),
+                    ("chi_tro",           "Chi tay ve phia truoc"),
+                    ("bo_tay_vao_tui",    "Bo tay vao tui quan"),
+                    ("voi_lay_do",        "Voi tay lay do"),
+                ]
+
+                print("\n" + "="*60)
+                print(" THU VIDEO IDLE ".center(60))
+                print("="*60)
+                print("\n  Danh sach hanh dong IDLE:")
+                for i, (key, desc) in enumerate(idle_actions, 1):
+                    label    = f"__idle__{key}"
+                    existing = self.metadata['labels'].get(label, {}).get('num_videos', 0)
+                    status   = f"({existing} video)" if existing else "(chua co)"
+                    print(f"  {i:>2}. {desc:<40} {status}")
+                print(f"\n   0. Thu tat ca theo thu tu")
+                print(f"  99. Nhap ten hanh dong rieng")
+                print("="*60)
+
+                try:
+                    choice = input("\n  Chon (0 / 1-12 / 99): ").strip()
+
+                    if choice == "0":
+                        for key, desc in idle_actions:
+                            label = f"__idle__{key}"
+                            print(f"\n  Chuan bi thu: {desc}")
+                            input(f"  Nhan ENTER de bat dau '{label}'...")
+                            self.collect_label(label)
+
+                    elif choice == "99":
+                        custom = input("  Nhap ten hanh dong (vd: nhin_dien_thoai): ").strip()
+                        if not custom:
+                            print("  Ten khong duoc de trong!")
+                        else:
+                            label     = f"__idle__{custom}"
+                            viet_name = input(f"  Ten tieng Viet cho '{label}': ").strip()
+                            viet_name = viet_name if viet_name else label
+
+                            # Lưu display name
+                            dn_path = os.path.normpath(
+                                os.path.join(self.output_dir, '..', 'processed', 'display_names.json'))
+                            os.makedirs(os.path.dirname(dn_path), exist_ok=True)
+                            dn = {}
+                            if os.path.exists(dn_path):
+                                with open(dn_path, 'r', encoding='utf-8') as f:
+                                    dn = json.load(f)
+                            if label not in dn:
+                                dn[label] = viet_name
+                                with open(dn_path, 'w', encoding='utf-8') as f:
+                                    json.dump(dn, f, indent=2, ensure_ascii=False)
+                            self.collect_label(label)
+
+                    else:
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(idle_actions):
+                            key, desc = idle_actions[idx]
+                            label = f"__idle__{key}"
+                            print(f"\n  Chuan bi thu: {desc}")
+                            self.collect_label(label)
+                        else:
+                            print("  Lua chon khong hop le!")
+
+                except ValueError:
+                    print("  Vui long nhap so!")
+            elif ch == "5":
                 self._save_meta()
                 print("\n Da luu metadata")
                 self.show_statistics()
