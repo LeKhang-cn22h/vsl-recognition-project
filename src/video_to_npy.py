@@ -34,11 +34,15 @@ from datetime import datetime
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
-
+from dotenv import load_dotenv
 
 # ═══════════════════════════════════════════════════════════
 # CẤU HÌNH
 # ═══════════════════════════════════════════════════════════
+
+
+load_dotenv()
+
 
 SEQUENCE_LENGTH = 30
 
@@ -96,7 +100,112 @@ def download_model(filename):
     print(f"  Da tai xong {filename}")
     return filename
 
+try:
+    from huggingface_hub import HfApi, hf_hub_download
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+class HFUploader:
+    """Upload file .npy lên HuggingFace Dataset, bỏ qua nếu đã tồn tại"""
 
+    def __init__(self, repo_id=None, token=None, enabled=True):
+        self.enabled = enabled and HF_AVAILABLE
+        self.repo_id = repo_id
+        self.token   = token
+        self.api     = None
+
+        if self.enabled and repo_id and token:
+            self.api = HfApi(token=token)
+            print(f"  HuggingFace: OK (repo={repo_id})")
+        elif self.enabled and repo_id and not token:
+            self.api = HfApi()
+            print(f"  HuggingFace: OK - repo public (repo={repo_id})")
+        else:
+            self.enabled = False
+            if not HF_AVAILABLE:
+                print("  HuggingFace: CHUA CAI huggingface_hub")
+            elif not repo_id:
+                print("  HuggingFace: KHONG CO REPO ID - Chi luu local")
+            else:
+                print("  HuggingFace: tat (nguoi dung chon khong upload)")
+
+    def file_exists_on_hf(self, remote_path):
+        """Kiểm tra file đã tồn tại trên HF chưa"""
+        if not self.enabled or self.api is None:
+            return False
+        try:
+            hf_hub_download(
+                repo_id=self.repo_id,
+                filename=remote_path,
+                repo_type="dataset",
+                token=self.token,
+            )
+            return True
+        except Exception:
+            return False
+
+    def upload(self, local_path, label_name, filename):
+        """
+        Upload 1 file .npy lên HuggingFace.
+        Cấu trúc trên HF: processed/<label>/<filename>
+        Trả về True nếu upload thành công, False nếu bỏ qua hoặc lỗi.
+        """
+        if not self.enabled or self.api is None:
+            return False
+
+        remote_path = f"processed/{label_name}/{filename}"
+
+        # Kiểm tra tồn tại → bỏ qua nếu đã có
+        if self.file_exists_on_hf(remote_path):
+            return False  # bỏ qua, không in gì để không spam
+
+        try:
+            self.api.upload_file(
+                path_or_fileobj=local_path,
+                path_in_repo=remote_path,
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                token=self.token,
+                commit_message=f"Add processed/{label_name}/{filename}",
+            )
+            return True
+        except Exception as ex:
+            print(f"    [HF] Loi upload {filename}: {ex}")
+            return False
+
+    def upload_batch(self, file_list, label_name):
+        """
+        Upload nhiều file cùng lúc, báo cáo tóm tắt.
+        file_list: list[(local_path, filename)]
+        """
+        if not self.enabled or self.api is None:
+            return
+
+        uploaded = 0
+        skipped  = 0
+        errors   = 0
+
+        for local_path, filename in file_list:
+            remote_path = f"processed/{label_name}/{filename}"
+            if self.file_exists_on_hf(remote_path):
+                skipped += 1
+                continue
+            try:
+                self.api.upload_file(
+                    path_or_fileobj=local_path,
+                    path_in_repo=remote_path,
+                    repo_id=self.repo_id,
+                    repo_type="dataset",
+                    token=self.token,
+                    commit_message=f"Add {label_name} npy batch",
+                )
+                uploaded += 1
+            except Exception as ex:
+                print(f"    [HF] Loi upload {filename}: {ex}")
+                errors += 1
+
+        print(f"    [HF] Upload xong: {uploaded} moi | "
+              f"{skipped} da co | {errors} loi")
 # ═══════════════════════════════════════════════════════════
 # FEATURE EXTRACTOR
 # ═══════════════════════════════════════════════════════════
@@ -571,9 +680,11 @@ class Augmenter:
 # ═══════════════════════════════════════════════════════════
 
 class VideoToNPY:
-    def __init__(self, output_dir='data/processed', sequence_length=SEQUENCE_LENGTH):
-        self.output_dir = output_dir
-        self.seq_len    = sequence_length
+    def __init__(self, output_dir='data/processed', sequence_length=SEQUENCE_LENGTH,
+                 hf_uploader=None):
+        self.output_dir  = output_dir
+        self.seq_len     = sequence_length
+        self.hf_uploader = hf_uploader  # HFUploader instance hoặc None
         os.makedirs(output_dir, exist_ok=True)
 
         self.extractor = FullBodyExtractor()
@@ -595,7 +706,7 @@ class VideoToNPY:
                 'face (30 key landmarks x 3)': self.extractor.face_dim,
                 'hands (21 x 2 x 3)': self.extractor.hand_dim,
                 'blendshapes (17 key)': self.extractor.blend_dim,
-                'interactions (19)': self.extractor.interact_dim,
+                'interactions (31)': self.extractor.interact_dim,
             },
             'face_landmark_indices': FACE_KEY_INDICES,
             'key_blendshapes': KEY_BLENDSHAPES,
@@ -625,7 +736,7 @@ class VideoToNPY:
             if not ret:
                 break
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             features = self.extractor.extract_frame(rgb)
             features = KeypointNormalizer.normalize_frame(
                 features,
@@ -659,14 +770,27 @@ class VideoToNPY:
 
         if enable_augmentation:
             augs = self.augmenter.generate(normalized)
+            upload_list = []
             for suffix, data in augs:
-                fn = f"{vid_id}_{suffix}.npy"
-                np.save(os.path.join(save_dir, fn), data.astype(np.float32))
+                fn         = f"{vid_id}_{suffix}.npy"
+                local_path = os.path.join(save_dir, fn)
+                np.save(local_path, data.astype(np.float32))
+                upload_list.append((local_path, fn))
             print(f"    Da tao {len(augs)} file augmentation")
+
+            # Upload batch lên HF
+            if self.hf_uploader:
+                self.hf_uploader.upload_batch(upload_list, label_name)
         else:
-            fn = f"{vid_id}_org.npy"
-            np.save(os.path.join(save_dir, fn), normalized.astype(np.float32))
+            fn         = f"{vid_id}_org.npy"
+            local_path = os.path.join(save_dir, fn)
+            np.save(local_path, normalized.astype(np.float32))
             print(f"    Da luu: {fn}")
+
+            if self.hf_uploader:
+                ok = self.hf_uploader.upload(local_path, label_name, fn)
+                if ok:
+                    print(f"    [HF] Uploaded: {fn}")
 
         return True
 
@@ -688,8 +812,6 @@ class VideoToNPY:
                 success += 1
 
         print(f"\n  Hoan thanh: {success}/{len(videos)} video da xu ly")
-
-        # Tự động cập nhật label map sau khi xử lý folder
         self._update_label_map(label_name)
 
     def process_collector_output(self, collector_dir='data/videos',
@@ -724,8 +846,24 @@ class VideoToNPY:
         self._save_label_map(labels.keys())
 
     def _update_label_map(self, new_label):
-        """[FIX-4] Cập nhật label map khi thêm label mới từ process_folder/video"""
         path = os.path.join(self.output_dir, 'label_map.json')
+        dn_path = os.path.join(self.output_dir, 'display_names.json')
+        if os.path.exists(dn_path):
+            with open(dn_path, 'r', encoding='utf-8') as f:
+                dn = json.load(f)
+        else:
+            dn = {}
+
+        if new_label not in dn:
+            # Hỏi người dùng tên tiếng Việt
+            viet_name = input(
+                f"  Nhap ten tieng Viet cho '{new_label}' "
+                f"(Enter de giu nguyen): "
+            ).strip()
+            dn[new_label] = viet_name if viet_name else new_label
+            with open(dn_path, 'w', encoding='utf-8') as f:
+                json.dump(dn, f, indent=2, ensure_ascii=False)
+            print(f"  Da luu: '{new_label}' → '{dn[new_label]}'")
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
                 label_map = json.load(f)
@@ -747,7 +885,6 @@ class VideoToNPY:
         print(f"\n  Da luu label map ({len(labels)} labels): {path}")
 
     def show_statistics(self):
-        """[FIX-5] Hiển thị gốc vs augmented riêng biệt"""
         print("\n" + "="*60)
         print(" THONG KE DU LIEU DA XU LY ".center(60))
         print("="*60)
@@ -782,14 +919,41 @@ class VideoToNPY:
     def close(self):
         self.extractor.close()
 
-
 # ═══════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════
 
 def main():
-    converter = VideoToNPY(output_dir='data/processed')
+    print("\n" + "="*60)
+    print(" HUGGINGFACE UPLOAD CONFIG ".center(60))
+    print("="*60)
 
+    hf_repo  = os.getenv("HF_REPO_ID", "").strip()
+    hf_token = os.getenv("HF_TOKEN",   "").strip() or None
+
+    if hf_repo:
+        print(f"  Da doc tu .env: HF_REPO_ID={hf_repo}")
+        use_hf = input("  Upload npy len HuggingFace? (y/n, mac dinh y): ").strip().lower()
+        use_hf = (use_hf != 'n')
+    else:
+        print("  Khong tim thay HF_REPO_ID trong .env")
+        hf_repo = input("  Nhap Repo ID (vd: KhangCN/Video_VSL) hoac Enter de bo qua: ").strip()
+        if hf_repo:
+            hf_token = input("  Nhap HF Token (Enter neu repo public): ").strip() or None
+            use_hf   = True
+        else:
+            use_hf = False
+
+    hf_uploader = None
+    if use_hf:
+        if HF_AVAILABLE:
+            hf_uploader = HFUploader(repo_id=hf_repo, token=hf_token, enabled=True)
+        else:
+            print("  CANH BAO: Chua cai huggingface_hub. Chay: pip install huggingface_hub")
+    else:
+        print("  Bo qua HuggingFace upload.")
+
+    converter = VideoToNPY(output_dir='data/processed', hf_uploader=hf_uploader)
     while True:
         print("\n" + "="*60)
         print(" VIDEO TO NPY - FULL BODY ".center(60, "="))

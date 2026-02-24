@@ -1306,11 +1306,35 @@ class WebcamVideoCollectorFull:
             if ch == "1":
                 self.show_statistics()
             elif ch == "2":
-                lb = input("\n Nhap ten nhan moi: ").strip()
+                lb = input("\n Nhap ten nhan moi (không dấu: ").strip()
                 if not lb:
                     print(" Ten nhan khong duoc de trong!")
                     continue
                 lb = lb.lower().replace(" ", "_")
+
+                # Hỏi tên tiếng Việt ngay lúc tạo nhãn
+                viet_name = input(f" Nhap ten tieng Viet cho '{lb}': ").strip()
+                if not viet_name:
+                    viet_name = lb  # fallback giữ nguyên key nếu bỏ trống
+
+                # Lưu vào display_names.json
+                dn_path = os.path.join(self.output_dir, '..', 'processed', 'display_names.json')
+                dn_path = os.path.normpath(dn_path)
+                os.makedirs(os.path.dirname(dn_path), exist_ok=True)
+                if os.path.exists(dn_path):
+                    with open(dn_path, 'r', encoding='utf-8') as f:
+                        dn = json.load(f)
+                else:
+                    dn = {}
+
+                if lb not in dn:
+                    dn[lb] = viet_name
+                    with open(dn_path, 'w', encoding='utf-8') as f:
+                        json.dump(dn, f, indent=2, ensure_ascii=False)
+                    print(f" Da luu: '{lb}' → '{viet_name}'")
+                else:
+                    print(f" '{lb}' da co trong display_names: '{dn[lb]}'")
+
                 if lb in self.metadata['labels']:
                     print(f" Nhan '{lb}' da ton tai!")
                     if input("  Tiep tuc thu them? (y/n): ").strip().lower() != 'y':

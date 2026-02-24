@@ -100,7 +100,17 @@ def download_model(filename):
         urllib.request.urlretrieve(MODEL_URLS[filename], filename)
     return filename
 
+# Load display names (tên hiển thị tiếng Việt)
+display_names = {}
+display_path = 'data/processed/display_names.json'
+if os.path.exists(display_path):
+    with open(display_path, 'r', encoding='utf-8') as f:
+        display_names = json.load(f)
+    print(f"  Da load {len(display_names)} ten hien thi tieng Viet")
 
+def get_display_name(label_key):
+    """Chuyển label_key → tên tiếng Việt, fallback về key nếu chưa có"""
+    return display_names.get(label_key, label_key)
 # ═══════════════════════════════════════════════════════════
 # DUAL TRANSFORMER MODEL (copy từ train để standalone)
 # ═══════════════════════════════════════════════════════════
@@ -486,8 +496,8 @@ class UIRenderer:
         # Top prediction (lớn)
         top_label, top_prob = top_preds[0]
         label_col = cls.ACCENT if top_prob >= confidence_thr else cls.YELLOW
-        cv2.putText(frame, top_label.upper().replace('_', ' '),
-                    (px+12, py+68), cls.FONT, 0.85, label_col, 2)
+        cv2.putText(frame, get_display_name(top_label).upper(),
+            (px+12, py+68), cls.FONT, 0.85, label_col, 2)
         # Confidence bar top1
         cls.draw_bar(frame, px+12, py+76, pw-24, 14,
                      top_prob, label_col)
@@ -499,7 +509,7 @@ class UIRenderer:
             ry = py + 100 + (i-1)*34
             if ry + 30 > py + ph:
                 break
-            cv2.putText(frame, f"{i+1}. {lbl.replace('_',' ')}",
+            cv2.putText(frame, f"{i+1}. {get_display_name(lbl)}",
                         (px+12, ry+14), cls.FONT, 0.48, cls.WHITE, 1)
             cls.draw_bar(frame, px+12, ry+18, pw-80, 9,
                          prob, cls.GRAY)
@@ -531,7 +541,7 @@ class UIRenderer:
                 break
             age_alpha = max(100, 220 - i * 20)
             c = (age_alpha, age_alpha, age_alpha)
-            cv2.putText(frame, f"{ts_str}  {label.replace('_',' '):<18} {conf*100:4.0f}%",
+            cv2.putText(frame, f"{ts_str}  {get_display_name(label):<18} {conf*100:4.0f}%",
                         (px+12, ty), cls.FONT, 0.38, c, 1)
 
     @classmethod
