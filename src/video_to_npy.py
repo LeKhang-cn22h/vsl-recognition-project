@@ -129,20 +129,7 @@ class HFUploader:
             else:
                 print("  HuggingFace: tat (nguoi dung chon khong upload)")
 
-    def file_exists_on_hf(self, remote_path):
-        """Kiểm tra file đã tồn tại trên HF chưa"""
-        if not self.enabled or self.api is None:
-            return False
-        try:
-            hf_hub_download(
-                repo_id=self.repo_id,
-                filename=remote_path,
-                repo_type="dataset",
-                token=self.token,
-            )
-            return True
-        except Exception:
-            return False
+    
 
     def upload(self, local_path, label_name, filename):
         """
@@ -175,37 +162,31 @@ class HFUploader:
 
     def upload_batch(self, file_list, label_name):
         """
-        Upload nhiều file cùng lúc, báo cáo tóm tắt.
-        file_list: list[(local_path, filename)]
+        Upload cả folder 1 lần = 1 commit duy nhất.
+        file_list: list[(local_path, filename)] — chỉ dùng để lấy folder path
         """
         if not self.enabled or self.api is None:
             return
+        if not file_list:
+            return
 
-        uploaded = 0
-        skipped  = 0
-        errors   = 0
+        # Lấy thư mục chứa các file (tất cả cùng 1 folder)
+        local_label_dir = os.path.dirname(file_list[0][0])
 
-        for local_path, filename in file_list:
-            remote_path = f"processed/{label_name}/{filename}"
-            if self.file_exists_on_hf(remote_path):
-                skipped += 1
-                continue
-            try:
-                self.api.upload_file(
-                    path_or_fileobj=local_path,
-                    path_in_repo=remote_path,
-                    repo_id=self.repo_id,
-                    repo_type="dataset",
-                    token=self.token,
-                    commit_message=f"Add {label_name} npy batch",
-                )
-                uploaded += 1
-            except Exception as ex:
-                print(f"    [HF] Loi upload {filename}: {ex}")
-                errors += 1
-
-        print(f"    [HF] Upload xong: {uploaded} moi | "
-              f"{skipped} da co | {errors} loi")
+        print(f"    [HF] Dang upload folder '{label_name}' ({len(file_list)} files)...")
+        try:
+            self.api.upload_folder(
+                folder_path=local_label_dir,
+                path_in_repo=f"processed/{label_name}",
+                repo_id=self.repo_id,
+                repo_type="dataset",
+                token=self.token,
+                commit_message=f"Add processed/{label_name} batch",
+                ignore_patterns=["*.tmp", "*.log"],
+            )
+            print(f"    [HF] Upload xong '{label_name}' (1 commit)")
+        except Exception as ex:
+            print(f"    [HF] Loi upload folder: {ex}")
 # ═══════════════════════════════════════════════════════════
 # FEATURE EXTRACTOR
 # ═══════════════════════════════════════════════════════════
