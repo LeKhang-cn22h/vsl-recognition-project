@@ -583,7 +583,7 @@ class WebcamVideoCollector:
         video_writer.release()
         video_count += 1
         print(f"  DUNG video {video_count} ({frame_count}f, {duration:.1f}s)")
-        upload_to_hf(fp, label_name)
+        upload_to_hf(fp, label_name, split="train")
         return video_count, now
 
     # ══════════════════════════════════════════════════════
@@ -645,6 +645,7 @@ class WebcamVideoCollector:
             elif ch == "6":
                 self._save_meta()
                 self.show_statistics()
+                self._ask_organize_on_exit()
                 print("\n  Tam biet!\n")
                 break
             else:
@@ -861,7 +862,7 @@ class WebcamVideoCollector:
                 import shutil
                 shutil.copy2(fp, local_target)
 
-            ok = upload_to_hf(local_target, label_name)
+            ok = upload_to_hf(local_target, label_name, split="train")
             if ok:
                 print("✓")
                 success += 1
@@ -957,6 +958,56 @@ class WebcamVideoCollector:
         extractor.close()
         print(f"\n  Hoan thanh: {success}/{len(videos)} video da xu ly.")
         print(f"  File .npy tai: data/processed/{label_name}/")
+
+    def _ask_organize_on_exit(self):
+        """
+        Hỏi có muốn chia train/val/test trước khi thoát không.
+        Gọi organize_dataset.organize() nếu đồng ý.
+        """
+        # Kiểm tra còn label nào chưa chia không
+        video_dir = self.output_dir
+        unorganized = []
+        skip = {'train', 'val', 'test'}
+        for entry in os.scandir(video_dir):
+            if entry.is_dir() and entry.name not in skip:
+                videos = [f for f in os.listdir(entry.path)
+                          if f.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm'))]
+                if videos:
+                    unorganized.append((entry.name, len(videos)))
+
+        if not unorganized:
+            return   # Không có gì cần chia
+
+        print("\n" + "="*60)
+        print(" CHIA TRAIN / VAL / TEST ".center(60))
+        print("="*60)
+        print(f"\n  Phat hien {len(unorganized)} label chua duoc chia:")
+        for lb, n in unorganized:
+            print(f"    - {lb}: {n} video")
+
+        ans = input("\n  Chia vao train/val/test ngay bay gio? (y/n): ").strip().lower()
+        if ans != 'y':
+            print("  Bo qua. Ban co the chay organize_dataset.py sau.")
+            return
+
+        # Gọi organize_dataset
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))))
+            from organize_dataset import organize
+            stats = organize(src_dir=video_dir, dry_run=False)
+            if stats:
+                print(f"\n  Da chia xong {len(stats)} labels!")
+                print(f"  Cau truc moi:")
+                print(f"    {video_dir}/train/<label>/*.mp4")
+                print(f"    {video_dir}/val/<label>/*.mp4")
+                print(f"    {video_dir}/test/<label>/*.mp4")
+        except ImportError:
+            print("\n  Khong tim thay organize_dataset.py")
+            print("  Hay chay: python organize_dataset.py")
+        except Exception as e:
+            print(f"\n  Loi khi chia: {e}")
 
     def close(self):
         self.pose_detector.close()
