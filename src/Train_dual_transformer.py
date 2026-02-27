@@ -101,7 +101,7 @@ def main():
         feat_dim    = cfg.FEAT_DIM,
         seq_len     = cfg.SEQ_LEN,
         num_classes = num_classes,
-        cfg         = cfg,
+        config      = cfg,
     )
 
     trainer = Trainer(

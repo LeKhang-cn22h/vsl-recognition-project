@@ -1,11 +1,5 @@
 """
 collector/ - Webcam data collection package
-=============================================
-    from collector import init_hf, upload_to_hf
-    from collector import FullBodyDrawer, draw_text_bg, lm_to_px
-    from collector import FramingChecker
-    from collector import FacialExpressionAnalyzer
-    from collector import InteractionVisualizer
 """
 
 from collector.hf_upload   import init_hf, upload_to_hf, HF_REPO_ID

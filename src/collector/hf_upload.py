@@ -1,7 +1,9 @@
 """
-collector/hf_upload.py - Upload video lên HuggingFace
-======================================================
-    from collector.hf_upload import upload_to_hf, init_hf
+Upload video lên HuggingFace
+Cấu trúc trên HF:
+    videos/train/<label>/*.mp4
+    videos/val/<label>/*.mp4
+    videos/test/<label>/*.mp4
 """
 
 import os
@@ -29,13 +31,14 @@ def init_hf():
         print("  HuggingFace: CHUA CAI huggingface_hub")
 
 
-def upload_to_hf(local_path: str, label_name: str) -> bool:
-    """Upload 1 video lên HuggingFace. Trả về True nếu thành công."""
+def upload_to_hf(local_path: str, label_name: str, split:str ='train') -> bool:
+    """Upload 1 video lên HuggingFace.  split: 'train' | 'val' | 'test'
+    Path trên HF: videos/<split>/<label>/<filename>."""
     if _hf_api is None:
         return False
     try:
         filename    = os.path.basename(local_path)
-        remote_path = f"videos/{label_name}/{filename}"
+        remote_path = f"videos/{split}/{label_name}/{filename}"
         _hf_api.upload_file(
             path_or_fileobj=local_path,
             path_in_repo=remote_path,

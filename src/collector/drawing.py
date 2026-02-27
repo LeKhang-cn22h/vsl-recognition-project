@@ -1,15 +1,12 @@
 """
-collector/drawing.py - Vẽ keypoints lên frame
-==============================================
-    from collector.drawing import FullBodyDrawer, draw_text_bg, lm_to_px
+Vẽ keypoints lên frame
 """
 
 import cv2
 import numpy as np
 
 
-# ── Tiện ích ──────────────────────────────────────────────
-
+# hàm tiện ích
 def lm_to_px(lm, w, h):
     """NormalizedLandmark → pixel (x, y)"""
     return int(lm.x * w), int(lm.y * h)
