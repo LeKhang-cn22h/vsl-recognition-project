@@ -2,6 +2,10 @@
 vsl/model.py - DualTransformer model definition
 =================================================
     from vsl.model import DualTransformer, load_model
+    Soft Gate: mỗi group token tự học attend bao nhiêu
+      dựa trên mức độ có data trong group đó
+      → interact=0 → gate≈0 → model bỏ qua
+      → hand mạnh  → gate≈1 → attend nhiều
 """
 
 import math
@@ -32,8 +36,20 @@ class PositionalEncoding(nn.Module):
 
 
 class SpatialTransformer(nn.Module):
-    """Xử lý 6 nhóm features theo không gian trong mỗi frame."""
-    NUM_TOKENS = 6
+    """Xử lý 5 nhóm features theo không gian trong mỗi frame.
+    Groups:
+      0: pose      (75 dims)
+      1: face      (90 dims)
+      2: left_hand (63 dims)
+      3: right_hand(63 dims)
+      4: interact  (55 dims)
+
+    Soft Gate — tự học mức độ attend mỗi group:
+      presence = mean(|group_features|)  → đo "group có data không"
+      gate     = sigmoid(linear(presence)) → 0~1
+      token    = project(group) * gate     → scale down nếu rỗng
+    """
+    NUM_TOKENS = 5
 
     def __init__(self, feat_dim, d_model, nhead, num_layers, ff_dim, dropout):
         super().__init__()
@@ -42,18 +58,36 @@ class SpatialTransformer(nn.Module):
             cfg.POSE_END  - cfg.POSE_START,
             cfg.FACE_END  - cfg.FACE_START,
             63, 63,   # left hand, right hand
-            cfg.BLEND_END    - cfg.BLEND_START,
             cfg.INTERACT_END - cfg.INTERACT_START,
         ]
-        self.group_projs = nn.ModuleList(
-            [nn.Linear(d, d_model) for d in group_dims])
+
+        self.group_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(d),
+                nn.Linear(d, d_model),
+            )
+            for d in self.group_dims
+        ])
+
+        # Token embedding (identity của từng group)
         self.token_embed = nn.Embedding(self.NUM_TOKENS, d_model)
+
+        # Soft Gate — mỗi group 1 linear: scalar → scalar
+        # Bias âm → gate bắt đầu thấp (~0.3), học dần
+        self.gate_projs = nn.ModuleList([
+            nn.Linear(1, 1) for _ in self.group_dims
+        ])
+        for gate in self.gate_projs:
+            nn.init.constant_(gate.bias, -0.5)
+
+        # Transformer encoder
         enc = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=ff_dim, dropout=dropout,
             batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(
             enc, num_layers=num_layers, norm=nn.LayerNorm(d_model))
+
         self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
     def _split(self, x: torch.Tensor):
@@ -62,19 +96,47 @@ class SpatialTransformer(nn.Module):
             x[:, :, cfg.FACE_START   :cfg.FACE_END],
             x[:, :, cfg.HAND_START   :cfg.HAND_START + 63],
             x[:, :, cfg.HAND_START+63:cfg.HAND_END],
-            x[:, :, cfg.BLEND_START  :cfg.BLEND_END],
             x[:, :, cfg.INTERACT_START:cfg.INTERACT_END],
         ]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                return_gates: bool = False):
+        """
+        x           : (B, T, FEAT_DIM)
+        return_gates: nếu True trả về (out, gate_values) để visualize
+        """
         B, T, _ = x.shape
-        toks = []
-        for i, (g, proj) in enumerate(zip(self._split(x), self.group_projs)):
-            tok = proj(g.reshape(B * T, -1)) + self.token_embed.weight[i]
-            toks.append(tok.unsqueeze(1))
+        toks      = []
+        gate_vals = []
+
+        for i, (g, proj, gate_proj) in enumerate(
+                zip(self._split(x), self.group_projs, self.gate_projs)):
+
+            g_flat = g.reshape(B * T, -1)                        # (B*T, dim)
+
+            # Tính presence: group này có data không?
+            presence = g_flat.abs().mean(dim=-1, keepdim=True)   # (B*T, 1)
+            gate     = torch.sigmoid(gate_proj(presence))         # (B*T, 1)
+            gate_vals.append(gate.detach().mean().item())
+
+            # Project + scale
+            tok = proj(g_flat) * gate                             # (B*T, d_model)
+            tok = tok + self.token_embed.weight[i]
+            toks.append(tok.unsqueeze(1))                         # (B*T, 1, d_model)
+
         tokens = torch.cat(
             [self.cls_token.expand(B * T, -1, -1)] + toks, dim=1)
-        return self.transformer(tokens)[:, 0, :].reshape(B, T, self.d_model)
+
+        out = self.transformer(tokens)[:, 0, :]
+        out = out.reshape(B, T, self.d_model)
+
+        if return_gates:
+            return out, gate_vals
+        return out
+
+    @staticmethod
+    def get_gate_names():
+        return ['pose', 'face', 'left_hand', 'right_hand', 'interact']
 
 
 class TemporalTransformer(nn.Module):
@@ -104,12 +166,19 @@ class TemporalTransformer(nn.Module):
 
 class DualTransformer(nn.Module):
     """
-    Kiến trúc chính:
-      Input (B, T, FEAT_DIM)
-        → SpatialTransformer  → (B, T, D)
-        → TemporalTransformer → CLS (B, D)
-        → Avg Pool            → (B, D)
-        → Concat + MLP        → Logits (B, num_classes)
+    Input  : (B, T, 346)
+    Output : (B, num_classes)
+
+    Luồng:
+      SpatialTransformer (5 groups + soft gate) → (B, T, D)
+      TemporalTransformer                        → (B, D)
+      mean(spatial) + temporal CLS → concat      → (B, 2D)
+      MLP classifier                             → (B, num_classes)
+
+    Soft gate giúp model tự học:
+      Ký hiệu thuần tay   : gate_interact≈0.2, gate_hand≈0.9
+      Ký hiệu chạm mặt   : gate_interact≈0.7, gate_face≈0.6
+      Ký hiệu chạm cằm/má: gate_interact≈0.8 (phân biệt ba/má)
     """
     def __init__(self, feat_dim: int, seq_len: int,
                  num_classes: int, config=cfg):
@@ -117,7 +186,7 @@ class DualTransformer(nn.Module):
         d = config.D_MODEL
         self.spatial = SpatialTransformer(
             feat_dim, d,
-            config.SPATIAL_HEADS, config.SPATIAL_LAYERS,
+            config.SPATIAL_HEADS,  config.SPATIAL_LAYERS,
             config.SPATIAL_FF_DIM, config.SPATIAL_DROPOUT)
         self.temporal = TemporalTransformer(
             d, config.TEMPORAL_HEADS, config.TEMPORAL_LAYERS,
@@ -136,6 +205,21 @@ class DualTransformer(nn.Module):
         t = self.temporal(s)
         return self.classifier(torch.cat([s.mean(1), t], dim=-1))
 
+    def forward_with_gates(self, x: torch.Tensor):
+        """
+        Dùng để visualize gate values trong realtime hoặc báo cáo.
+
+        Returns:
+            logits   : (B, num_classes)
+            gate_dict: {'pose': 0.45, 'face': 0.30,
+                        'left_hand': 0.80, 'right_hand': 0.75,
+                        'interact': 0.65}
+        """
+        s, gate_vals = self.spatial(x, return_gates=True)
+        t            = self.temporal(s)
+        logits       = self.classifier(torch.cat([s.mean(1), t], dim=-1))
+        gate_dict    = dict(zip(SpatialTransformer.get_gate_names(), gate_vals))
+        return logits, gate_dict
 
 # ═══════════════════════════════════════════════════════════
 # HELPER: Load checkpoint
