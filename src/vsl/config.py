@@ -47,19 +47,54 @@ KEY_BLENDSHAPES = [
     'browDownLeft', 'browDownRight',
     'noseSneerLeft',
 ]
+# 14 vùng mặt — face landmark indices
+# Dùng trong compute_interactions()
+FACE_REGION_INDICES = {
+    'tran':          [10, 67, 297],       # trán
+    'thai_duong_T':  [162, 21],           # thái dương trái
+    'thai_duong_P':  [389, 251],          # thái dương phải
+    'chan_may_T':    [70, 63, 105],       # chân mày trái
+    'chan_may_P':    [300, 293, 334],     # chân mày phải
+    'mat_T':         [159, 145],          # mắt trái
+    'mat_P':         [386, 374],          # mắt phải
+    'mui':           [4, 6],              # mũi
+    'ma_T':          [50, 117],           # má trái
+    'ma_P':          [280, 346],          # má phải
+    'mieng':         [13, 14],            # miệng
+    'cam':           [152, 175],          # cằm
+    'lo_tai_T':      [234, 93],           # lỗ tai trái
+    'lo_tai_P':      [454, 323],          # lỗ tai phải
+}
+FACE_REGION_NAMES = list(FACE_REGION_INDICES.keys())  # 14 vùng
 
+# 8 vùng body — pose landmark indices
+# Dùng trong compute_interactions()
+BODY_REGION_INDICES = {
+    'dau':       [0],           # đầu
+    'vai_T':     [11],          # vai trái
+    'vai_P':     [12],          # vai phải
+    'nguc':      [11, 12],      # ngực (giữa 2 vai)
+    'khuyu_T':   [13],          # khuỷu tay trái
+    'khuyu_P':   [14],          # khuỷu tay phải
+    'hong_T':    [23],          # hông trái
+    'hong_P':    [24],          # hông phải
+}
+BODY_REGION_NAMES = list(BODY_REGION_INDICES.keys())  # 8 vùng
+
+# Ngưỡng "chạm" — dùng cho binary flag
+TOUCH_THRESHOLD = 0.06
 
 class Config:
     # ── Sequence ──
     SEQ_LEN  = 30
-    FEAT_DIM = 339   # 75+90+126+17+31
+    FEAT_DIM = 346  # 75 + 90 + 126 + 0 (bỏ blend) + 55
 
-    # ── Feature layout (start:end index trong vector 339) ──
+    # ── Feature layout (start:end index trong vector 346) ──
     POSE_START,     POSE_END     = 0,   75
     FACE_START,     FACE_END     = 75,  165
     HAND_START,     HAND_END     = 165, 291
-    BLEND_START,    BLEND_END    = 291, 308
-    INTERACT_START, INTERACT_END = 308, 339
+    BLEND_START,    BLEND_END    = 291, 291
+    INTERACT_START, INTERACT_END = 291, 346
 
     # ── Model architecture ──
     D_MODEL           = 256
