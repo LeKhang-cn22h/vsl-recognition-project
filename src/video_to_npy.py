@@ -14,15 +14,10 @@ Cấu trúc folder OUTPUT:
     ├── test/<label>/*.npy    (chỉ _org)
     └── label_map.json
 
-Cách chạy:
-    python video_to_npy.py
-
-Menu:
-    1. Xử lý tự động toàn bộ (train + val + test)
-    2. Xử lý 1 split cụ thể
-    3. Xử lý 1 video đơn lẻ
-    4. Xem thống kê
-    5. Thoát
+Thay đổi v2:
+    - Bỏ KEY_BLENDSHAPES import (không còn dùng)
+    - Cập nhật feature_metadata: bỏ blendshapes, đổi interact 31→55
+    - FEAT_DIM: 339 → 346
 """
 
 import os
@@ -33,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
-from vsl.config    import cfg, FACE_KEY_INDICES, KEY_BLENDSHAPES
+from vsl.config    import cfg, FACE_KEY_INDICES
 from vsl.extractor import VideoExtractor
 from converter     import HFUploader, KeypointNormalizer, resample_sequence, Augmenter
 
@@ -48,7 +43,6 @@ class VideoToNPY:
     def __init__(self, video_base='data/videos',
                  output_base='data/processed',
                  hf_uploader=None):
-
         self.video_base  = video_base
         self.output_base = output_base
         self.hf          = hf_uploader
@@ -67,15 +61,17 @@ class VideoToNPY:
 
     def _save_feature_meta(self):
         meta = {
+            'version': 2,
             'sequence_length': cfg.SEQ_LEN,
             'total_features_per_frame': cfg.FEAT_DIM,
             'breakdown': {
-                'pose (25 x 3)':      cfg.POSE_END  - cfg.POSE_START,
-                'face (30 x 3)':      cfg.FACE_END  - cfg.FACE_START,
-                'hands (21 x 2 x 3)': cfg.HAND_END  - cfg.HAND_START,
-                'blendshapes (17)':   cfg.BLEND_END - cfg.BLEND_START,
-                'interactions (31)':  cfg.INTERACT_END - cfg.INTERACT_START,
+                'pose (25 x 3)':      cfg.POSE_END     - cfg.POSE_START,
+                'face (30 x 3)':      cfg.FACE_END     - cfg.FACE_START,
+                'hands (21 x 2 x 3)': cfg.HAND_END     - cfg.HAND_START,
+                'blendshapes':        0,
+                'interactions (55)':  cfg.INTERACT_END - cfg.INTERACT_START,
             },
+            'note': 'v2: Blendshapes removed. Interactions expanded 31->55.',
             'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
         path = os.path.join(self.output_base, 'feature_metadata.json')
@@ -105,8 +101,6 @@ class VideoToNPY:
             lm[label_name] = len(lm)
             with open(self._label_map_path(), 'w', encoding='utf-8') as f:
                 json.dump(lm, f, indent=2, ensure_ascii=False)
-
-    # ── Process 1 video ──────────────────────────────────
 
     def process_video(self, video_path, label_name, video_id,
                       split, augment):
@@ -166,24 +160,18 @@ class VideoToNPY:
                     print(f"    [HF] Uploaded")
         return True
 
-    # ── Process 1 split/label ────────────────────────────
-
     def process_split_label(self, split, label_name):
         augment   = (split == 'train')
         video_dir = os.path.join(self.video_base, split, label_name)
-
         if not os.path.isdir(video_dir):
             print(f"  CANH BAO: Khong tim thay {video_dir}")
             return 0
-
         videos = sorted([f for f in os.listdir(video_dir)
                          if Path(f).suffix.lower() in VIDEO_EXTS])
         if not videos:
             return 0
-
         aug_note = "co aug" if augment else "chi _org"
         print(f"\n  [{split.upper()}] {label_name} ({len(videos)} video, {aug_note})")
-
         success = 0
         for i, vf in enumerate(videos, 1):
             print(f"  [{i}/{len(videos)}] ", end="")
@@ -194,24 +182,19 @@ class VideoToNPY:
                 success += 1
         return success
 
-    # ── Process 1 split ──────────────────────────────────
-
     def process_split(self, split):
         split_dir = os.path.join(self.video_base, split)
         if not os.path.isdir(split_dir):
             print(f"  LOI: Khong tim thay {split_dir}")
             print(f"  Chay organize_dataset.py truoc!")
             return []
-
         labels = sorted([d for d in os.listdir(split_dir)
                          if os.path.isdir(os.path.join(split_dir, d))])
         if not labels:
             print(f"  [{split}] Khong co label nao"); return []
-
         print(f"\n{'='*55}")
         print(f"  SPLIT: {split.upper()} ({len(labels)} labels)")
         print(f"{'='*55}")
-
         done = []
         for lb in labels:
             n = self.process_split_label(split, lb)
@@ -220,8 +203,6 @@ class VideoToNPY:
                 self._add_to_label_map(lb)
         return done
 
-    # ── Process tất cả ───────────────────────────────────
-
     def process_all(self):
         missing = [sp for sp in SPLITS
                    if not os.path.isdir(os.path.join(self.video_base, sp))]
@@ -229,23 +210,18 @@ class VideoToNPY:
             print(f"\n  LOI: Thieu folder: {missing}")
             print(f"  Chay organize_dataset.py truoc!")
             return
-
         all_labels = set()
         for split in SPLITS:
             done = self.process_split(split)
             all_labels.update(done)
-
         if all_labels:
             self._save_label_map(all_labels)
             print(f"\n  Tong: {len(all_labels)} labels da xu ly xong")
-
-    # ── Statistics ────────────────────────────────────────
 
     def show_statistics(self):
         print("\n" + "="*65)
         print(" THONG KE FILE .NPY ".center(65))
         print("="*65)
-
         all_labels = set()
         data = {sp: {} for sp in SPLITS}
         for sp in SPLITS:
@@ -257,19 +233,16 @@ class VideoToNPY:
                 npy = list(Path(lp).glob('*.npy'))
                 data[sp][lb] = len(npy)
                 all_labels.add(lb)
-
         if not all_labels:
             print("\n  Chua co file .npy nao!")
-            print("  Chay option 1 de xu ly.")
             return
-
         print(f"\n  {'Label':<28} {'Train':>8} {'Val':>6} {'Test':>7} {'Tong':>6}")
         print("  " + "-"*58)
         grand = 0
         for lb in sorted(all_labels):
-            tr = data['train'].get(lb, 0)
-            va = data['val'].get(lb, 0)
-            te = data['test'].get(lb, 0)
+            tr  = data['train'].get(lb, 0)
+            va  = data['val'].get(lb, 0)
+            te  = data['test'].get(lb, 0)
             tot = tr + va + te; grand += tot
             print(f"  {lb:<28} {tr:>8} {va:>6} {te:>7} {tot:>6}")
         print("  " + "-"*58)
@@ -277,13 +250,13 @@ class VideoToNPY:
         va_t = sum(data['val'].values())
         te_t = sum(data['test'].values())
         print(f"  {'TONG CONG':<28} {tr_t:>8} {va_t:>6} {te_t:>7} {grand:>6}")
-        print(f"\n  Train co aug | Val/Test chi _org")
-        print(f"  Shape: ({cfg.SEQ_LEN}, {cfg.FEAT_DIM})")
+        print(f"\n  Shape  : ({cfg.SEQ_LEN}, {cfg.FEAT_DIM})")
+        print(f"  Layout : pose(75) + face(90) + hand(126) + interact(55)")
         lm_path = self._label_map_path()
         if os.path.exists(lm_path):
             with open(lm_path) as f:
                 lm = json.load(f)
-            print(f"  label_map.json: {len(lm)} labels")
+            print(f"  Labels : {len(lm)}")
         else:
             print(f"  CANH BAO: Chua co label_map.json!")
         print("="*65)
@@ -291,10 +264,6 @@ class VideoToNPY:
     def close(self):
         self.extractor.close()
 
-
-# ══════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════
 
 def _setup_hf():
     hf_repo  = os.getenv("HF_REPO_ID", "").strip()
@@ -332,14 +301,13 @@ def main():
         print("  4. Xem thong ke")
         print("  5. Thoat")
         print("="*55)
-        print("  Can: data/videos/train|val|test/<label>/")
+        print(f"  FEAT_DIM = {cfg.FEAT_DIM}  (pose+face+hand+interact)")
         print("="*55)
 
         ch = input("\n  Chon (1-5): ").strip()
 
         if ch == '1':
             converter.process_all()
-
         elif ch == '2':
             print("\n  1. train  2. val  3. test")
             sp_map = {'1': 'train', '2': 'val', '3': 'test',
@@ -351,7 +319,6 @@ def main():
             if done:
                 all_lm = set(converter._load_label_map().keys()) | set(done)
                 converter._save_label_map(all_lm)
-
         elif ch == '3':
             vpath = input("  Duong dan video: ").strip()
             label = input("  Ten label: ").strip()
@@ -365,15 +332,12 @@ def main():
             vid_id = os.path.splitext(os.path.basename(vpath))[0]
             if converter.process_video(vpath, label, vid_id, sp, sp == 'train'):
                 converter._add_to_label_map(label)
-
         elif ch == '4':
             converter.show_statistics()
-
         elif ch == '5':
             converter.close()
             print("\n  Tam biet!\n")
             break
-
         else:
             print("  Khong hop le!")
 
