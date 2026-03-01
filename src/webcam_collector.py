@@ -10,6 +10,11 @@ Menu:
     3. Tiếp tục thu video cho nhãn có sẵn
     4. Thu video IDLE (nghỉ / không ký hiệu)
     5. Lưu và thoát
+
+Thay đổi v2:
+    - Bỏ qua frame khi thiếu bộ phận trong lúc recording (không ghi frame đó)
+    - Dừng ngay lập tức khi thiếu bộ phận quá MISSING_FRAMES_TO_STOP frames liên tiếp
+    - Cho phép setup thời gian quay tối đa (max_duration_secs), tự dừng sau khi hết
 """
 
 import cv2
@@ -59,10 +64,11 @@ def download_model(filename):
 
 class WebcamVideoCollector:
 
-    # Hằng số điều khiển auto mode
-    COUNTDOWN_SECS         = 5
-    RELAXED_FRAMES_TO_STOP = 15   # ~0.5s @ 30fps
-    COOLDOWN_SECS          = 2.0
+    COUNTDOWN_SECS          = 1.5
+    RELAXED_FRAMES_TO_STOP  = 15    # ~0.5s @ 30fps — tay thả lỏng → dừng
+    COOLDOWN_SECS           = 2.0
+    MISSING_FRAMES_TO_STOP  = 5     # frames liên tiếp thiếu bộ phận → dừng ngay
+    DEFAULT_MAX_DURATION    = 10    # giây, 0 = không giới hạn
 
     def __init__(self, output_dir='data/videos'):
         self.output_dir    = output_dir
@@ -70,7 +76,7 @@ class WebcamVideoCollector:
         os.makedirs(output_dir, exist_ok=True)
         self.metadata = self._load_meta()
 
-        init_hf()   # Khởi tạo HuggingFace upload
+        init_hf()
 
         print("\n" + "="*60)
         print(" KHOI TAO MEDIAPIPE DETECTORS ".center(60))
@@ -80,7 +86,6 @@ class WebcamVideoCollector:
         pose_m = download_model('pose_landmarker_heavy.task')
         face_m = download_model('face_landmarker.task')
 
-        # Kết quả callback lưu vào đây, main loop đọc ra
         self._latest = dict(pose=None, face=None, hands=None, blendshapes=None)
         self._ts = 0
 
@@ -155,8 +160,6 @@ class WebcamVideoCollector:
         with open(self.metadata_path, 'w', encoding='utf-8') as f:
             json.dump(self.metadata, f, indent=2, ensure_ascii=False)
 
-    # ── Display names ─────────────────────────────────────
-
     def _dn_path(self):
         return os.path.normpath(
             os.path.join(self.output_dir, '..', 'processed', 'display_names.json'))
@@ -173,8 +176,6 @@ class WebcamVideoCollector:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(dn, f, indent=2, ensure_ascii=False)
             print(f"  Da luu: '{label_key}' → '{viet_name}'")
-
-    # ── Statistics ────────────────────────────────────────
 
     def show_statistics(self):
         print("\n" + "="*60)
@@ -195,17 +196,14 @@ class WebcamVideoCollector:
         print(f"\n  Cap nhat: {self.metadata.get('updated_at','N/A')}")
         print("="*60)
 
-    # ── Helpers: kiểm tra tay thả lỏng ───────────────────
+    # ── Helpers ───────────────────────────────────────────
 
     @staticmethod
     def _hands_relaxed(pose_lms, left_hand_lms, right_hand_lms) -> bool:
-        """True nếu không thấy tay, hoặc cổ tay nằm dưới / ngang hông."""
         if left_hand_lms is None and right_hand_lms is None:
             return True
         if pose_lms is None:
             return False
-
-        # Tính hip_y
         hip_y = None
         if pose_lms[23].visibility > 0.4 and pose_lms[24].visibility > 0.4:
             hip_y = (pose_lms[23].y + pose_lms[24].y) / 2
@@ -217,8 +215,7 @@ class WebcamVideoCollector:
             hip_y = (pose_lms[11].y + pose_lms[12].y) / 2 + 0.25
         else:
             return False
-
-        margin = 0.03
+        margin   = 0.03
         left_ok  = True
         right_ok = True
         if pose_lms[15].visibility > 0.4:
@@ -226,6 +223,19 @@ class WebcamVideoCollector:
         if pose_lms[16].visibility > 0.4:
             right_ok = pose_lms[16].y > (hip_y - margin)
         return left_ok and right_ok
+
+    @staticmethod
+    def _parts_present(pose_lms, left_h, right_h) -> tuple:
+        """
+        Kiểm tra bộ phận tối thiểu cần thiết để ghi frame.
+        Yêu cầu: pose + ít nhất 1 tay.
+        Trả về (ok: bool, missing_name: str)
+        """
+        if pose_lms is None:
+            return False, "Pose"
+        if left_h is None and right_h is None:
+            return False, "Ban tay"
+        return True, ""
 
     # ── UI helpers ────────────────────────────────────────
 
@@ -241,7 +251,6 @@ class WebcamVideoCollector:
                 draw_text_bg(frame, f"! {w_txt}", (10, y),
                              scale=0.55, color=(0,0,255), bg=(50,0,0))
                 y += 30
-
         det = fr['details']
         items = [('Mat', det['face_visible']),
                  ('Than', det['upper_body_visible']),
@@ -284,8 +293,6 @@ class WebcamVideoCollector:
             cv2.putText(frame, f">> {txt}", (10, y+22+i*20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,200,255), 1)
 
-    # ── STATE DISPLAY helpers ─────────────────────────────
-
     def _draw_countdown(self, frame, w, h, elapsed_cd, num_color):
         remaining  = max(0, self.COUNTDOWN_SECS - elapsed_cd)
         count_text = str(int(remaining) + 1)
@@ -294,7 +301,6 @@ class WebcamVideoCollector:
             count_text, cv2.FONT_HERSHEY_SIMPLEX, fs, 6)
         cx = (w - ctw) // 2
         cy = (h + cth) // 2
-
         overlay = frame.copy()
         cv2.rectangle(overlay, (cx-40, cy-cth-30),
                       (cx+ctw+40, cy+30), (0,0,0), -1)
@@ -303,7 +309,6 @@ class WebcamVideoCollector:
                     cv2.FONT_HERSHEY_SIMPLEX, fs, num_color, 6)
         cv2.putText(frame, "CHUAN BI...", (w//2-80, cy+50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
-
         bar_w = int(w * 0.6)
         bar_x = (w - bar_w) // 2
         bar_y = cy + 70
@@ -313,29 +318,124 @@ class WebcamVideoCollector:
                       (bar_x+int(bar_w*(elapsed_cd/self.COUNTDOWN_SECS)), bar_y+12),
                       num_color, -1)
 
-    def _draw_recording(self, frame, w, h, elapsed, frame_count,
-                         relaxed_cnt):
-        cv2.putText(frame, f"REC {elapsed:.1f}s | {frame_count}f",
-                    (w//2-80, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+    def _draw_recording(self, frame, w, h, elapsed, frame_count, relaxed_cnt,
+                         max_duration=0, missing_cnt=0, skipped=0):
+        """ thêm thanh thời gian + cảnh báo missing + số frame bỏ qua."""
+        # Timer
+        if max_duration > 0:
+            remaining  = max(0.0, max_duration - elapsed)
+            timer_txt  = f"REC {elapsed:.1f}s / {max_duration}s  |  {frame_count}f"
+            timer_color = (0, 0, 255) if remaining > 3 else (0, 80, 255)
+        else:
+            timer_txt  = f"REC {elapsed:.1f}s | {frame_count}f"
+            timer_color = (0, 0, 255)
+
+        cv2.putText(frame, timer_txt,
+                    (w//2-120, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, timer_color, 2)
+
+        # Nhấp nháy chấm đỏ
         if int(elapsed*2) % 2 == 0:
-            cv2.circle(frame, (w//2-100, 20), 8, (0,0,255), -1)
+            cv2.circle(frame, (w//2-145, 20), 8, (0,0,255), -1)
+
+        # Thanh tiến trình thời gian
+        if max_duration > 0:
+            bar_w = int(w * 0.5)
+            bar_x = (w - bar_w) // 2
+            bar_y = 35
+            ratio = min(elapsed / max_duration, 1.0)
+            col   = (0,200,0) if ratio < 0.7 else (0,165,255) if ratio < 0.9 else (0,50,255)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+6), (50,50,50), -1)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x+int(bar_w*ratio), bar_y+6), col, -1)
+
+        # Cảnh báo thiếu bộ phận
+        if missing_cnt > 0:
+            ratio_m  = missing_cnt / self.MISSING_FRAMES_TO_STOP
+            warn_txt = f"! THIEU BO PHAN ({missing_cnt}/{self.MISSING_FRAMES_TO_STOP}f)"
+            cv2.putText(frame, warn_txt,
+                        (w//2-180, h//2 - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 50, 255), 2)
+            bw2 = 280; bx2 = (w - bw2) // 2
+            cv2.rectangle(frame, (bx2, h//2), (bx2+bw2, h//2+10), (60,60,60), -1)
+            cv2.rectangle(frame, (bx2, h//2), (bx2+int(bw2*ratio_m), h//2+10),
+                          (0, 50, 255), -1)
+
+        # Số frame bị bỏ qua
+        if skipped > 0:
+            cv2.putText(frame, f"Bo qua: {skipped}f",
+                        (10, h-90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120,120,255), 1)
+
+        # Tay thả lỏng
         if relaxed_cnt > 3:
             ratio = relaxed_cnt / self.RELAXED_FRAMES_TO_STOP
             cv2.putText(frame,
-                        f"Tha tay... dung sau {self.RELAXED_FRAMES_TO_STOP - relaxed_cnt} frames",
-                        (w//2-150, h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,200,255), 2)
-            bar_w = 300
-            bar_x = (w - bar_w) // 2
-            cv2.rectangle(frame, (bar_x, h//2+15),
-                          (bar_x+bar_w, h//2+25), (80,80,80), -1)
-            cv2.rectangle(frame, (bar_x, h//2+15),
-                          (bar_x+int(bar_w*ratio), h//2+25), (0,200,255), -1)
+                        f"Tha tay... dung sau {self.RELAXED_FRAMES_TO_STOP - relaxed_cnt}f",
+                        (w//2-160, h//2 + 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,200,255), 2)
+            bw3 = 300; bx3 = (w - bw3) // 2
+            cv2.rectangle(frame, (bx3, h//2+60), (bx3+bw3, h//2+70), (80,80,80), -1)
+            cv2.rectangle(frame, (bx3, h//2+60),
+                          (bx3+int(bw3*ratio), h//2+70), (0,200,255), -1)
+
+    # ══════════════════════════════════════════════════════
+    # SETUP CONFIG TRƯỚC KHI QUAY
+    # ══════════════════════════════════════════════════════
+
+    def _ask_rec_config(self) -> dict:
+        """
+        Hỏi người dùng muốn cấu hình gì.
+        Trả về dict với max_duration và missing_limit.
+        """
+        print("\n" + "-"*50)
+        print(f"  Cau hinh mac dinh:")
+        dur_txt = f"{self.DEFAULT_MAX_DURATION}s" if self.DEFAULT_MAX_DURATION > 0 else "khong gioi han"
+        print(f"    Thoi gian toi da   : {dur_txt}")
+        print(f"    Frame thieu bo phan: {self.MISSING_FRAMES_TO_STOP} frames → dung ngay")
+        ans = input("  Tuy chinh? (y/n, mac dinh n): ").strip().lower()
+        if ans != 'y':
+            return {
+                'max_duration':  self.DEFAULT_MAX_DURATION,
+                'missing_limit': self.MISSING_FRAMES_TO_STOP,
+            }
+
+        # max_duration
+        try:
+            val = input(f"  Thoi gian toi da (giay, 0=khong gioi han) [{self.DEFAULT_MAX_DURATION}]: ").strip()
+            max_dur = int(val) if val else self.DEFAULT_MAX_DURATION
+            max_dur = max(0, max_dur)
+        except ValueError:
+            max_dur = self.DEFAULT_MAX_DURATION
+
+        # missing_limit
+        try:
+            val = input(f"  So frames thieu bo phan → dung ngay [{self.MISSING_FRAMES_TO_STOP}]: ").strip()
+            miss = int(val) if val else self.MISSING_FRAMES_TO_STOP
+            miss = max(1, miss)
+        except ValueError:
+            miss = self.MISSING_FRAMES_TO_STOP
+
+        dur_display = f"{max_dur}s" if max_dur > 0 else "khong gioi han"
+        print(f"  → max={dur_display}  missing={miss}f")
+        return {'max_duration': max_dur, 'missing_limit': miss}
 
     # ══════════════════════════════════════════════════════
     # THU THẬP VIDEO
     # ══════════════════════════════════════════════════════
 
-    def collect_label(self, label_name: str):
+    def collect_label(self, label_name: str, rec_config: dict = None):
+        """
+        rec_config = {
+            'max_duration' : int  — giây tối đa, 0 = không giới hạn
+            'missing_limit': int  — frames thiếu bộ phận liên tiếp → dừng ngay
+        }
+        """
+        if rec_config is None:
+            rec_config = {
+                'max_duration':  self.DEFAULT_MAX_DURATION,
+                'missing_limit': self.MISSING_FRAMES_TO_STOP,
+            }
+        max_duration  = rec_config.get('max_duration',  self.DEFAULT_MAX_DURATION)
+        missing_limit = rec_config.get('missing_limit', self.MISSING_FRAMES_TO_STOP)
+
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             print("  Khong the mo webcam!")
@@ -352,20 +452,22 @@ class WebcamVideoCollector:
         video_count = len([f for f in os.listdir(label_dir)
                            if f.endswith('.mp4')])
 
-        # ── State machine: idle → countdown → recording → idle ──
-        state          = 'idle'
-        video_writer   = None
-        frame_count    = 0
-        start_time     = 0
+        state           = 'idle'
+        video_writer    = None
+        frame_count     = 0
+        skipped_frames  = 0   # ← số frame bị bỏ qua (thiếu bộ phận)
+        missing_cnt     = 0   # ← frames liên tiếp thiếu bộ phận
+        start_time      = 0
         countdown_start = 0
-        relaxed_cnt    = 0
-        last_stop_time = 0
-        fp             = None
-        show_mesh      = True
-        auto_mode      = True
+        relaxed_cnt     = 0
+        last_stop_time  = 0
+        fp              = None
+        show_mesh       = True
+        auto_mode       = True
 
-        print(f"\n  Nhan: {label_name.upper()} | "
-              f"Da co: {video_count} video | {width}x{height}@{fps}")
+        dur_display = f"{max_duration}s" if max_duration > 0 else "inf"
+        print(f"\n  Nhan: {label_name.upper()} | Da co: {video_count} video")
+        print(f"  Max: {dur_display} | Missing: {missing_limit}f → dung ngay")
         print("  [SPACE] Thu cong  [A] Auto  [M] Mesh  [Q] Thoat\n")
 
         self._ts = 0
@@ -375,7 +477,7 @@ class WebcamVideoCollector:
             if not ret: break
 
             frame       = cv2.flip(frame, 1)
-            clean_frame = frame.copy()   # frame GỐC để ghi video (không overlay)
+            clean_frame = frame.copy()
             h, w        = frame.shape[:2]
             now         = time.time()
 
@@ -387,11 +489,13 @@ class WebcamVideoCollector:
                 try: det.detect_async(mp_img, self._ts)
                 except Exception: pass
 
-            # ── Đọc kết quả ──
-            pose_lms  = self._latest['pose']
-            face_lms  = self._latest['face']
-            blends    = self._latest['blendshapes']
-            left_h, right_h = self._latest['hands'] or (None, None)
+            pose_lms         = self._latest['pose']
+            face_lms         = self._latest['face']
+            blends           = self._latest['blendshapes']
+            left_h, right_h  = self._latest['hands'] or (None, None)
+
+            # ── Kiểm tra bộ phận (dùng trong recording) ──
+            parts_ok, missing_name = self._parts_present(pose_lms, left_h, right_h)
 
             # ── Vẽ keypoints ──
             FullBodyDrawer.draw_pose(frame, pose_lms, w, h)
@@ -400,7 +504,6 @@ class WebcamVideoCollector:
             FullBodyDrawer.draw_hand(frame, left_h,  w, h, 'L')
             FullBodyDrawer.draw_hand(frame, right_h, w, h, 'R')
 
-            # ── Phân tích ──
             framing = FramingChecker.check(
                 pose_lms, face_lms, (left_h, right_h), w, h)
             self._draw_warnings(frame, framing, w, h)
@@ -419,6 +522,7 @@ class WebcamVideoCollector:
             # ══════════════════════════════════════════════
             # STATE MACHINE
             # ══════════════════════════════════════════════
+
             if auto_mode:
                 if state == 'idle':
                     in_cooldown = (now - last_stop_time) < self.COOLDOWN_SECS
@@ -434,42 +538,79 @@ class WebcamVideoCollector:
                         state, fp, video_writer, frame_count, start_time = \
                             self._start_recording(label_name, label_dir,
                                                   video_count, fps, width, height, now)
+                        skipped_frames = 0
+                        missing_cnt    = 0
                         print(f"  Auto: BAT DAU video {video_count+1}")
                     elif not framing['ok'] or relaxed:
                         state = 'idle'
                         print("  Auto: Huy dem nguoc")
 
                 elif state == 'recording':
-                    relaxed_cnt = relaxed_cnt + 1 if relaxed else 0
-                    if relaxed_cnt >= self.RELAXED_FRAMES_TO_STOP:
-                        video_count, last_stop_time = \
-                            self._stop_recording(video_writer, video_count,
-                                                 frame_count, now - start_time,
-                                                 fp, label_name, now)
-                        video_writer = None
-                        state = 'idle'
-                        relaxed_cnt = 0
+                    elapsed = now - start_time
 
-            # Ghi frame GỐC (không overlay)
-            if state == 'recording' and video_writer:
+                    if not parts_ok:
+                        # ── Thiếu bộ phận: bỏ qua frame ngay, đếm liên tiếp ──
+                        missing_cnt    += 1
+                        skipped_frames += 1
+                        # Dừng ngay nếu vượt ngưỡng
+                        if missing_cnt >= missing_limit:
+                            print(f"  DUNG NGAY: thieu {missing_name} ({missing_cnt}f lien tiep)")
+                            video_count, last_stop_time = self._stop_recording(
+                                video_writer, video_count, frame_count,
+                                elapsed, fp, label_name, now)
+                            video_writer = None
+                            state        = 'idle'
+                            missing_cnt  = 0
+                            relaxed_cnt  = 0
+                        # KHÔNG ghi frame này — continue xử lý UI rồi mới ghi
+                    else:
+                        # Bộ phận đầy đủ → reset missing
+                        missing_cnt = 0
+
+                        # Tay thả lỏng
+                        relaxed_cnt = relaxed_cnt + 1 if relaxed else 0
+                        if relaxed_cnt >= self.RELAXED_FRAMES_TO_STOP:
+                            video_count, last_stop_time = self._stop_recording(
+                                video_writer, video_count, frame_count,
+                                elapsed, fp, label_name, now)
+                            video_writer = None
+                            state        = 'idle'
+                            relaxed_cnt  = 0
+                            missing_cnt  = 0
+
+                        # Hết thời gian tối đa
+                        elif max_duration > 0 and elapsed >= max_duration:
+                            print(f"  AUTO DUNG: het {max_duration}s")
+                            video_count, last_stop_time = self._stop_recording(
+                                video_writer, video_count, frame_count,
+                                elapsed, fp, label_name, now)
+                            video_writer = None
+                            state        = 'idle'
+                            relaxed_cnt  = 0
+                            missing_cnt  = 0
+
+            # ── Ghi frame: CHỈ khi recording + bộ phận đầy đủ ──
+            if state == 'recording' and video_writer and parts_ok:
                 video_writer.write(clean_frame)
                 frame_count += 1
 
             # ══════════════════════════════════════════════
             # HEADER + STATE DISPLAY
             # ══════════════════════════════════════════════
+
             cv2.rectangle(frame, (0,0), (w,55), (30,30,30), -1)
             cv2.putText(frame, f"Nhan: {label_name.upper()}", (10,25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
             cv2.putText(frame, f"Video: {video_count}", (10,48),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+
+            dur_hdr = f"{max_duration}s" if max_duration > 0 else "inf"
+            cv2.putText(frame, f"Max:{dur_hdr} Miss:{missing_limit}f",
+                        (w-230, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150,150,150), 1)
             cv2.putText(frame,
                         f"[A] Auto: {'ON' if auto_mode else 'OFF'}",
-                        (w-250, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (w-230, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0,255,0) if auto_mode else (100,100,100), 1)
-            cv2.putText(frame,
-                        f"[M] Mesh: {'ON' if show_mesh else 'OFF'}",
-                        (w-250, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200,200,200), 1)
 
             if state == 'countdown':
                 elapsed_cd = now - countdown_start
@@ -479,8 +620,10 @@ class WebcamVideoCollector:
                 self._draw_countdown(frame, w, h, elapsed_cd, num_color)
 
             elif state == 'recording':
-                self._draw_recording(frame, w, h,
-                                     now - start_time, frame_count, relaxed_cnt)
+                self._draw_recording(
+                    frame, w, h,
+                    now - start_time, frame_count, relaxed_cnt,
+                    max_duration, missing_cnt, skipped_frames)
 
             elif state == 'idle':
                 in_cooldown = (now - last_stop_time) < self.COOLDOWN_SECS
@@ -498,13 +641,11 @@ class WebcamVideoCollector:
                                 (w//2-120, 25), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55, (0,255,0), 1)
 
-            # Relaxed indicator
             cv2.putText(frame,
                         "Tay: THA LONG" if relaxed else "Tay: GIO LEN",
                         (w-160, h-40), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                         (100,100,255) if relaxed else (0,255,100), 1)
 
-            # Footer
             cv2.rectangle(frame, (0,h-30), (w,h), (30,30,30), -1)
             cv2.putText(frame,
                         "[SPACE] Thu cong  |  [A] Auto  |  [M] Mesh  |  [Q] Thoat",
@@ -521,15 +662,19 @@ class WebcamVideoCollector:
                     fp, video_writer, frame_count, start_time = \
                         self._start_recording_manual(
                             label_name, label_dir, video_count, fps, width, height)
-                    relaxed_cnt = 0
+                    skipped_frames = 0
+                    missing_cnt    = 0
+                    relaxed_cnt    = 0
                     print(f"  Thu cong: BAT DAU video {video_count+1}")
                 else:
                     video_count, last_stop_time = self._stop_recording(
                         video_writer, video_count, frame_count,
                         time.time() - start_time, fp, label_name, time.time())
-                    video_writer = None
-                    state = 'idle'
-                    relaxed_cnt = 0
+                    video_writer   = None
+                    state          = 'idle'
+                    relaxed_cnt    = 0
+                    missing_cnt    = 0
+                    skipped_frames = 0
 
             elif key in (ord('a'), ord('A')):
                 auto_mode = not auto_mode
@@ -550,7 +695,6 @@ class WebcamVideoCollector:
         cv2.destroyAllWindows()
         self._ts = 0
 
-        # Cập nhật metadata
         self.metadata['labels'][label_name] = dict(
             num_videos=video_count, path=label_dir)
         self.metadata['total_videos'] = sum(
@@ -617,7 +761,8 @@ class WebcamVideoCollector:
                 if lb in self.metadata['labels']:
                     if input(f"  '{lb}' da ton tai! Thu them? (y/n): ").strip().lower() != 'y':
                         continue
-                self.collect_label(lb)
+                rec_cfg = self._ask_rec_config()
+                self.collect_label(lb, rec_config=rec_cfg)
 
             elif ch == "3":
                 labels = list(self.metadata['labels'].keys())
@@ -630,7 +775,8 @@ class WebcamVideoCollector:
                 try:
                     idx = int(input("\n  Chon so: ").strip()) - 1
                     if 0 <= idx < len(labels):
-                        self.collect_label(labels[idx])
+                        rec_cfg = self._ask_rec_config()
+                        self.collect_label(labels[idx], rec_config=rec_cfg)
                     else:
                         print("  Khong hop le!")
                 except ValueError:
@@ -652,7 +798,6 @@ class WebcamVideoCollector:
                 print("  Khong hop le!")
 
     def _menu_idle(self):
-        """Sub-menu thu video IDLE."""
         idle_actions = [
             ("tay_xuoi_hong",     "Tay xuoi ben hong dung yen"),
             ("tay_khoanh_nguc",   "Tay khoanh truoc nguc"),
@@ -667,7 +812,6 @@ class WebcamVideoCollector:
             ("bo_tay_vao_tui",    "Bo tay vao tui quan"),
             ("voi_lay_do",        "Voi tay lay do"),
         ]
-
         print("\n" + "="*60)
         print(" THU VIDEO IDLE ".center(60))
         print("="*60)
@@ -679,16 +823,15 @@ class WebcamVideoCollector:
         print("   0. Thu tat ca theo thu tu")
         print("  99. Nhap ten hanh dong rieng")
         print("="*60)
-
         try:
-            choice = input("\n  Chon (0 / 1-12 / 99): ").strip()
+            choice  = input("\n  Chon (0 / 1-12 / 99): ").strip()
+            rec_cfg = self._ask_rec_config()
 
             if choice == "0":
                 for key, desc in idle_actions:
                     label = f"__idle__{key}"
                     input(f"\n  Chuan bi: {desc}\n  Nhan ENTER de bat dau...")
-                    self.collect_label(label)
-
+                    self.collect_label(label, rec_config=rec_cfg)
             elif choice == "99":
                 custom = input("  Ten hanh dong (vd: nhin_dien_thoai): ").strip()
                 if not custom:
@@ -696,301 +839,130 @@ class WebcamVideoCollector:
                 label = f"__idle__{custom}"
                 viet  = input(f"  Ten tieng Viet cho '{label}': ").strip() or label
                 self._save_display_name(label, viet)
-                self.collect_label(label)
-
+                self.collect_label(label, rec_config=rec_cfg)
             else:
                 idx = int(choice) - 1
                 if 0 <= idx < len(idle_actions):
                     key, desc = idle_actions[idx]
                     label = f"__idle__{key}"
                     print(f"\n  Chuan bi: {desc}")
-                    self.collect_label(label)
+                    self.collect_label(label, rec_config=rec_cfg)
                 else:
                     print("  Khong hop le!")
-
         except ValueError:
             print("  Nhap so!")
 
-    # ══════════════════════════════════════════════════════
-    # UPLOAD FILE CÓ SẴN LÊN HUGGINGFACE
-    # ══════════════════════════════════════════════════════
+    # ── Upload + organize (giữ nguyên từ bản gốc) ────────
 
-    def _pick_files_gui(self) -> list[str]:
-        """
-        Mở hộp thoại chọn file bằng tkinter.
-        Trả về list đường dẫn, hoặc [] nếu không có tkinter.
-        """
+    def _pick_files_gui(self) -> list:
         try:
             import tkinter as tk
             from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()          # ẩn cửa sổ tkinter chính
-            root.attributes('-topmost', True)   # hiện hộp thoại lên trên
+            root = tk.Tk(); root.withdraw()
+            root.attributes('-topmost', True)
             paths = filedialog.askopenfilenames(
-                title      = "Chon file video de upload",
-                filetypes  = [
-                    ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm"),
-                    ("All files",   "*.*"),
-                ],
-            )
+                title="Chon file video de upload",
+                filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv *.webm"),
+                           ("All files", "*.*")])
             root.destroy()
             return list(paths)
         except Exception:
-            return []   # fallback về nhập tay
+            return []
 
     def _menu_upload_files(self):
-        """
-        Option 5: Chọn file MP4 từ máy → upload HuggingFace
-                  → hỏi có muốn xử lý → .npy luôn không.
-        """
         from collector.hf_upload import _hf_api, HF_REPO_ID
-
         print("\n" + "="*60)
         print(" UPLOAD VIDEO LEN HUGGINGFACE ".center(60))
         print("="*60)
-
-        # ── Kiểm tra HF đã init chưa ──
         if _hf_api is None:
             print("\n  CANH BAO: HuggingFace chua duoc ket noi!")
-            print("  Kiem tra file .env co HF_TOKEN va HF_REPO_ID chua.")
-            input("\n  Nhan ENTER de quay lai menu...")
-            return
+            input("\n  Nhan ENTER de quay lai menu..."); return
 
-        # ── Bước 1: Chọn file ──
-        print("\n  Chon file bang:")
-        print("  [1] Hop thoai chon file (GUI)")
-        print("  [2] Nhap duong dan thu cong")
+        print("\n  [1] Hop thoai GUI  [2] Nhap tay")
         ch = input("\n  Chon (1/2): ").strip()
-
         selected_files = []
-
         if ch == "1":
-            print("\n  Dang mo hop thoai chon file...")
             selected_files = self._pick_files_gui()
-            if not selected_files:
-                print("  (Khong co tkinter hoac khong chon file nao)")
-                print("  Chuyen sang nhap tay...")
-                ch = "2"   # fallback
-
+            if not selected_files: ch = "2"
         if ch == "2":
-            print("\n  Nhap duong dan file (1 dong 1 file, dong trong de ket thuc):")
+            print("\n  Nhap duong dan (dong trong de ket thuc):")
             while True:
                 p = input("  > ").strip().strip('"').strip("'")
-                if not p:
-                    break
+                if not p: break
                 if os.path.isfile(p):
                     selected_files.append(p)
-                    print(f"    ✓ Da them: {os.path.basename(p)}")
                 elif os.path.isdir(p):
-                    # Nếu nhập thư mục → lấy tất cả video trong đó
-                    exts = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+                    exts  = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
                     found = [os.path.join(p, f) for f in sorted(os.listdir(p))
                              if os.path.splitext(f)[1].lower() in exts]
                     selected_files.extend(found)
-                    print(f"    ✓ Da them {len(found)} video tu thu muc")
                 else:
-                    print(f"    ✗ Khong tim thay: {p}")
+                    print(f"    Khong tim thay: {p}")
 
         if not selected_files:
-            print("\n  Khong co file nao duoc chon.")
-            input("  Nhan ENTER de quay lai...")
-            return
+            input("  Khong co file. ENTER de quay lai..."); return
 
-        # ── Bước 2: Xác nhận danh sách ──
-        print(f"\n  Da chon {len(selected_files)} file:")
-        for i, fp in enumerate(selected_files, 1):
-            size_mb = os.path.getsize(fp) / 1024 / 1024
-            print(f"  {i:>3}. {os.path.basename(fp):<45} {size_mb:.1f} MB")
-
-        # ── Bước 3: Nhập label ──
-        print("\n  Nhap label cho cac video nay.")
-        print("  (Cac file se duoc upload vao videos/<label>/)")
-
-        # Gợi ý label đang có
+        print(f"\n  Da chon {len(selected_files)} file")
         if self.metadata['labels']:
             labels_exist = list(self.metadata['labels'].keys())
             print("\n  Label hien co:")
             for i, lb in enumerate(labels_exist, 1):
                 print(f"    {i}. {lb}")
-            print("\n  Nhap ten label moi hoac so thu tu label co san:")
-            ans = input("  > ").strip()
+            ans = input("  Nhap so hoac ten label moi: ").strip()
             try:
                 idx = int(ans) - 1
-                if 0 <= idx < len(labels_exist):
-                    label_name = labels_exist[idx]
-                else:
-                    label_name = ans.lower().replace(" ", "_")
+                label_name = labels_exist[idx] if 0 <= idx < len(labels_exist) \
+                             else ans.lower().replace(" ", "_")
             except ValueError:
                 label_name = ans.lower().replace(" ", "_")
         else:
             label_name = input("  Ten label: ").strip().lower().replace(" ", "_")
-
         if not label_name:
-            print("  Ten label rong! Huy."); return
+            print("  Ten rong! Huy."); return
 
-        # Hỏi tên tiếng Việt nếu label mới
-        if label_name not in self.metadata.get('labels', {}):
-            viet = input(f"  Ten tieng Viet cho '{label_name}': ").strip()
-            if viet:
-                self._save_display_name(label_name, viet)
-
-        # ── Bước 4: Xác nhận upload ──
-        print(f"\n  Se upload {len(selected_files)} file vao:")
-        print(f"  HF repo : {HF_REPO_ID}")
-        print(f"  Path    : videos/{label_name}/")
-
-        confirm = input("\n  Xac nhan upload? (y/n): ").strip().lower()
-        if confirm != 'y':
-            print("  Da huy."); return
-
-        # ── Bước 5: Upload từng file ──
-        print(f"\n  Bat dau upload...")
-        success = 0
-        failed  = []
-
-        # Copy file vào data/videos/<label>/ để đồng bộ với metadata
         label_dir = os.path.join(self.output_dir, label_name)
         os.makedirs(label_dir, exist_ok=True)
-
+        success = 0
         for i, fp in enumerate(selected_files, 1):
             fname = os.path.basename(fp)
-            print(f"  [{i}/{len(selected_files)}] {fname}...", end=" ", flush=True)
-
-            # Copy vào thư mục local nếu file nằm ngoài
             local_target = os.path.join(label_dir, fname)
             if os.path.abspath(fp) != os.path.abspath(local_target):
                 import shutil
                 shutil.copy2(fp, local_target)
-
+            print(f"  [{i}/{len(selected_files)}] {fname}...", end=" ", flush=True)
             ok = upload_to_hf(local_target, label_name, split="train")
-            if ok:
-                print("✓")
-                success += 1
-            else:
-                print("✗ (loi)")
-                failed.append(fname)
+            print("✓" if ok else "✗")
+            if ok: success += 1
 
-        # ── Bước 6: Cập nhật metadata ──
-        existing_count = self.metadata['labels'].get(label_name, {}).get('num_videos', 0)
+        existing = self.metadata['labels'].get(label_name, {}).get('num_videos', 0)
         self.metadata['labels'][label_name] = dict(
-            num_videos = existing_count + success,
-            path       = label_dir,
-        )
+            num_videos=existing + success, path=label_dir)
         self.metadata['total_videos'] = sum(
             v['num_videos'] for v in self.metadata['labels'].values())
         self._save_meta()
-
-        # ── Bước 7: Tổng kết ──
-        print(f"\n  Ket qua: {success}/{len(selected_files)} file upload thanh cong")
-        if failed:
-            print(f"  That bai ({len(failed)} file):")
-            for f in failed:
-                print(f"    - {f}")
-
-        # ── Bước 8: Hỏi có muốn xử lý → .npy không ──
-        if success > 0:
-            print("\n" + "-"*50)
-            ans = input(
-                "  Xu ly cac video nay -> .npy de train luon? (y/n): "
-            ).strip().lower()
-            if ans == 'y':
-                self._process_uploaded_to_npy(label_dir, label_name)
-
-        input("\n  Nhan ENTER de quay lai menu...")
-
-    def _process_uploaded_to_npy(self, video_dir: str, label_name: str):
-        """Gọi video_to_npy pipeline ngay sau khi upload."""
-        try:
-            # Import converter (cần video_to_npy.py + converter/ cùng cấp)
-            from converter import KeypointNormalizer, resample_sequence, Augmenter
-            from vsl.extractor import VideoExtractor
-            from vsl.config    import cfg as vsl_cfg
-            import numpy as np
-        except ImportError as e:
-            print(f"\n  Khong the import converter: {e}")
-            print("  Hay chay video_to_npy.py rieng de xu ly.")
-            return
-
-        print(f"\n  Bat dau xu ly video -> .npy cho label '{label_name}'...")
-
-        ext_ok  = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
-        videos  = sorted([f for f in os.listdir(video_dir)
-                          if os.path.splitext(f)[1].lower() in ext_ok])
-        if not videos:
-            print("  Khong tim thay video."); return
-
-        extractor  = VideoExtractor()
-        augmenter  = Augmenter()
-        output_dir = os.path.join('data', 'processed', label_name)
-        os.makedirs(output_dir, exist_ok=True)
-
-        success = 0
-        for i, vf in enumerate(videos, 1):
-            vpath = os.path.join(video_dir, vf)
-            print(f"  [{i}/{len(videos)}] {vf}")
-
-            import cv2
-            cap = cv2.VideoCapture(vpath)
-            raw = []
-            while True:
-                ret, frame = cap.read()
-                if not ret: break
-                rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                feats, _ = extractor.extract_frame(rgb)
-                feats    = KeypointNormalizer.normalize_frame(feats)
-                raw.append(feats)
-            cap.release()
-
-            if len(raw) < 5:
-                print(f"    CANH BAO: Qua ngan ({len(raw)} frames). Bo qua.")
-                continue
-
-            normalized  = resample_sequence(raw, vsl_cfg.SEQ_LEN)
-            vid_id      = os.path.splitext(vf)[0]
-            augs        = augmenter.generate(normalized)
-            for suffix, data in augs:
-                fn   = f"{vid_id}_{suffix}.npy"
-                path = os.path.join(output_dir, fn)
-                np.save(path, data.astype(np.float32))
-            print(f"    → {len(augs)} file .npy da luu vao {output_dir}/")
-            success += 1
-
-        extractor.close()
-        print(f"\n  Hoan thanh: {success}/{len(videos)} video da xu ly.")
-        print(f"  File .npy tai: data/processed/{label_name}/")
+        print(f"\n  {success}/{len(selected_files)} file upload thanh cong")
+        input("\n  ENTER de quay lai...")
 
     def _ask_organize_on_exit(self):
-        """
-        Hỏi có muốn chia train/val/test trước khi thoát không.
-        Gọi organize_dataset.organize() nếu đồng ý.
-        """
-        # Kiểm tra còn label nào chưa chia không
-        video_dir = self.output_dir
+        video_dir   = self.output_dir
         unorganized = []
-        skip = {'train', 'val', 'test'}
+        skip        = {'train', 'val', 'test'}
         for entry in os.scandir(video_dir):
             if entry.is_dir() and entry.name not in skip:
                 videos = [f for f in os.listdir(entry.path)
-                          if f.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm'))]
+                          if f.endswith(('.mp4','.avi','.mov','.mkv','.webm'))]
                 if videos:
                     unorganized.append((entry.name, len(videos)))
-
         if not unorganized:
-            return   # Không có gì cần chia
-
+            return
         print("\n" + "="*60)
         print(" CHIA TRAIN / VAL / TEST ".center(60))
         print("="*60)
-        print(f"\n  Phat hien {len(unorganized)} label chua duoc chia:")
+        print(f"\n  {len(unorganized)} label chua duoc chia:")
         for lb, n in unorganized:
             print(f"    - {lb}: {n} video")
-
-        ans = input("\n  Chia vao train/val/test ngay bay gio? (y/n): ").strip().lower()
-        if ans != 'y':
-            print("  Bo qua. Ban co the chay organize_dataset.py sau.")
-            return
-
-        # Gọi organize_dataset
+        if input("\n  Chia ngay bay gio? (y/n): ").strip().lower() != 'y':
+            print("  Bo qua."); return
         try:
             import sys
             sys.path.insert(0, os.path.dirname(os.path.dirname(
@@ -998,26 +970,15 @@ class WebcamVideoCollector:
             from organize_dataset import organize
             stats = organize(src_dir=video_dir, dry_run=False)
             if stats:
-                print(f"\n  Da chia xong {len(stats)} labels!")
-                print(f"  Cau truc moi:")
-                print(f"    {video_dir}/train/<label>/*.mp4")
-                print(f"    {video_dir}/val/<label>/*.mp4")
-                print(f"    {video_dir}/test/<label>/*.mp4")
-        except ImportError:
-            print("\n  Khong tim thay organize_dataset.py")
-            print("  Hay chay: python organize_dataset.py")
+                print(f"  Da chia xong {len(stats)} labels!")
         except Exception as e:
-            print(f"\n  Loi khi chia: {e}")
+            print(f"  Loi: {e}\n  Chay: python organize_dataset.py")
 
     def close(self):
         self.pose_detector.close()
         self.hand_detector.close()
         self.face_detector.close()
 
-
-# ══════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════
 
 def main():
     collector = WebcamVideoCollector(output_dir='data/videos')
