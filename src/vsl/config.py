@@ -86,7 +86,7 @@ TOUCH_THRESHOLD = 0.06
 
 class Config:
     # ── Sequence ──
-    SEQ_LEN  = 30
+    SEQ_LEN  = 64
     FEAT_DIM = 346  # 75 + 90 + 126 + 0 (bỏ blend) + 55
 
     # ── Feature layout (start:end index trong vector 346) ──

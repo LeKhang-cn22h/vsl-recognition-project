@@ -2,6 +2,12 @@
 trainer/dataset.py - VSL Dataset + DataLoader builder
 ======================================================
     from trainer.dataset import VSLDataset, build_dataloaders, compute_split_counts
+
+Cấu trúc folder:
+    data/processed/
+    ├── train/<label>/*.npy
+    ├── val/<label>/*.npy
+    └── test/<label>/*.npy
 """
 
 import os
@@ -12,26 +18,45 @@ from collections import Counter
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
-from sklearn.model_selection import train_test_split as sk_split
+from torch.utils.data import Dataset, DataLoader
 
 from vsl.config import cfg as vsl_cfg
 
 
 class VSLDataset(Dataset):
-    """Đọc file .npy từ data/processed/<label>/*.npy → shape (seq_len, feat_dim)"""
+    """
+    Đọc file .npy từ data/processed/<split>/<label>/*.npy
+    → shape (seq_len, feat_dim)
+    """
 
-    def __init__(self, data_dir: str, label_map: dict, augment: bool = False):
+    def __init__(self, data_dir: str, label_map: dict,
+                 split: str = 'train', augment: bool = False):
+        """
+        data_dir : thư mục gốc, ví dụ 'data/processed'
+        split    : 'train' | 'val' | 'test'
+        augment  : runtime augmentation nhẹ (chỉ dùng cho train)
+        """
         self.samples = []
         self.augment = augment
+        split_dir    = os.path.join(data_dir, split)
+
+        if not os.path.isdir(split_dir):
+            print(f"  CANH BAO: Khong tim thay split dir: {split_dir}")
+            return
+
         for label_name, label_idx in label_map.items():
-            label_dir = os.path.join(data_dir, label_name)
+            label_dir = os.path.join(split_dir, label_name)
             if not os.path.isdir(label_dir):
-                print(f"  CANH BAO: Khong tim thay: {label_dir}")
+                print(f"  CANH BAO: [{split}] Khong tim thay: {label_dir}")
                 continue
-            for fp in sorted(Path(label_dir).glob('*.npy')):
+            npy_files = sorted(Path(label_dir).glob('*.npy'))
+            if not npy_files:
+                print(f"  CANH BAO: [{split}/{label_name}] Khong co file .npy")
+                continue
+            for fp in npy_files:
                 self.samples.append((str(fp), label_idx))
-        print(f"  Dataset: {len(self.samples)} samples, {len(label_map)} classes")
+
+        print(f"  [{split:5s}] {len(self.samples)} samples")
 
     def __len__(self):
         return len(self.samples)
@@ -45,11 +70,9 @@ class VSLDataset(Dataset):
 
     def _runtime_aug(self, data: np.ndarray) -> np.ndarray:
         """Runtime augmentation nhẹ: noise + random temporal crop."""
-        # Gaussian noise
         if np.random.rand() < 0.5:
             data = data + np.random.normal(0, 0.002, data.shape).astype(np.float32)
 
-        # Random temporal crop
         if np.random.rand() < 0.3:
             T     = data.shape[0]
             start = np.random.randint(0, max(1, T // 10))
@@ -68,16 +91,14 @@ class VSLDataset(Dataset):
 
 
 def compute_split_counts(train_ds, val_ds, test_ds, label_map: dict) -> dict:
-    """Đếm số mẫu mỗi class trong từng split — dùng cho biểu đồ phân bổ."""
+    """Đếm số mẫu mỗi class trong từng split."""
     idx2label = {v: k for k, v in label_map.items()}
     counts    = {name: {'train': 0, 'val': 0, 'test': 0}
                  for name in label_map}
 
     def _count(ds, split_name):
-        for _, label_idx in ds:
-            li   = label_idx.item() if isinstance(label_idx, torch.Tensor) \
-                   else label_idx
-            name = idx2label.get(li, str(li))
+        for _, label_idx in ds.samples:
+            name = idx2label.get(label_idx, str(label_idx))
             if name in counts:
                 counts[name][split_name] += 1
 
@@ -89,53 +110,31 @@ def compute_split_counts(train_ds, val_ds, test_ds, label_map: dict) -> dict:
 
 def build_dataloaders(data_dir: str, label_map: dict, cfg) -> tuple:
     """
-    Stratified split → đảm bảo mỗi split có đủ tất cả class.
-    Fallback về random split nếu có class < 3 mẫu.
-
+    Đọc train/val/test từ split folder riêng biệt.
     Trả về: (train_loader, val_loader, test_loader, split_counts)
     """
-    full_ds = VSLDataset(data_dir, label_map, augment=False)
-    if len(full_ds) == 0:
-        raise ValueError("Dataset trong! Kiem tra thu muc data/processed/")
+    train_ds = VSLDataset(data_dir, label_map, split='train', augment=True)
+    val_ds   = VSLDataset(data_dir, label_map, split='val',   augment=False)
+    test_ds  = VSLDataset(data_dir, label_map, split='test',  augment=False)
 
-    all_indices  = list(range(len(full_ds)))
-    all_labels   = [full_ds.samples[i][1] for i in all_indices]
-    class_counts = Counter(all_labels)
-    min_count    = min(class_counts.values())
-    test_ratio   = 1.0 - cfg.TRAIN_RATIO - cfg.VAL_RATIO
+    total = len(train_ds) + len(val_ds) + len(test_ds)
+    print(f"  Tong: {total} samples "
+          f"(train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)})")
 
-    if min_count < 3:
-        print(f"  CANH BAO: Co class chi co {min_count} mau → dung random split")
-        np.random.seed(42)
-        np.random.shuffle(all_indices)
-        n         = len(all_indices)
-        n_test    = max(1, int(n * test_ratio))
-        n_val     = max(1, int(n * cfg.VAL_RATIO))
-        test_idx  = all_indices[:n_test]
-        val_idx   = all_indices[n_test:n_test + n_val]
-        train_idx = all_indices[n_test + n_val:]
-    else:
-        train_idx, temp_idx, _, temp_labels = sk_split(
-            all_indices, all_labels,
-            test_size=(test_ratio + cfg.VAL_RATIO),
-            stratify=all_labels, random_state=42,
+    if len(train_ds) == 0:
+        raise ValueError(
+            "Train dataset trong!\n"
+            f"  Kiem tra thu muc: {os.path.join(data_dir, 'train')}\n"
+            "  Chay video_to_npy.py truoc de tao file .npy"
         )
-        val_idx, test_idx = sk_split(
-            temp_idx, test_size=0.5,
-            stratify=temp_labels, random_state=42,
-        )
-
-    print(f"  Split: Train {len(train_idx)} | Val {len(val_idx)} | Test {len(test_idx)}")
-
-    train_aug_ds = VSLDataset(data_dir, label_map, augment=True)
-    train_ds = Subset(train_aug_ds, train_idx)
-    val_ds   = Subset(VSLDataset(data_dir, label_map, augment=False), val_idx)
-    test_ds  = Subset(VSLDataset(data_dir, label_map, augment=False), test_idx)
 
     kw = dict(num_workers=0, pin_memory=(cfg.DEVICE == 'cuda'))
-    train_loader = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,  **kw)
-    val_loader   = DataLoader(val_ds,   batch_size=cfg.BATCH_SIZE, shuffle=False, **kw)
-    test_loader  = DataLoader(test_ds,  batch_size=cfg.BATCH_SIZE, shuffle=False, **kw)
+    train_loader = DataLoader(train_ds, batch_size=cfg.BATCH_SIZE,
+                              shuffle=True,  **kw)
+    val_loader   = DataLoader(val_ds,   batch_size=cfg.BATCH_SIZE,
+                              shuffle=False, **kw)
+    test_loader  = DataLoader(test_ds,  batch_size=cfg.BATCH_SIZE,
+                              shuffle=False, **kw)
 
     split_counts = compute_split_counts(train_ds, val_ds, test_ds, label_map)
     return train_loader, val_loader, test_loader, split_counts

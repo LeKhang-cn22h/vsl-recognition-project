@@ -54,7 +54,8 @@ class SpatialTransformer(nn.Module):
     def __init__(self, feat_dim, d_model, nhead, num_layers, ff_dim, dropout):
         super().__init__()
         self.d_model = d_model
-        group_dims = [
+        # ── FIX: gán vào self.group_dims thay vì biến local ──
+        self.group_dims = [
             cfg.POSE_END  - cfg.POSE_START,
             cfg.FACE_END  - cfg.FACE_START,
             63, 63,   # left hand, right hand
@@ -73,7 +74,6 @@ class SpatialTransformer(nn.Module):
         self.token_embed = nn.Embedding(self.NUM_TOKENS, d_model)
 
         # Soft Gate — mỗi group 1 linear: scalar → scalar
-        # Bias âm → gate bắt đầu thấp (~0.3), học dần
         self.gate_projs = nn.ModuleList([
             nn.Linear(1, 1) for _ in self.group_dims
         ])
@@ -101,10 +101,6 @@ class SpatialTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor,
                 return_gates: bool = False):
-        """
-        x           : (B, T, FEAT_DIM)
-        return_gates: nếu True trả về (out, gate_values) để visualize
-        """
         B, T, _ = x.shape
         toks      = []
         gate_vals = []
@@ -112,17 +108,14 @@ class SpatialTransformer(nn.Module):
         for i, (g, proj, gate_proj) in enumerate(
                 zip(self._split(x), self.group_projs, self.gate_projs)):
 
-            g_flat = g.reshape(B * T, -1)                        # (B*T, dim)
-
-            # Tính presence: group này có data không?
-            presence = g_flat.abs().mean(dim=-1, keepdim=True)   # (B*T, 1)
-            gate     = torch.sigmoid(gate_proj(presence))         # (B*T, 1)
+            g_flat = g.reshape(B * T, -1)
+            presence = g_flat.abs().mean(dim=-1, keepdim=True)
+            gate     = torch.sigmoid(gate_proj(presence))
             gate_vals.append(gate.detach().mean().item())
 
-            # Project + scale
-            tok = proj(g_flat) * gate                             # (B*T, d_model)
+            tok = proj(g_flat) * gate
             tok = tok + self.token_embed.weight[i]
-            toks.append(tok.unsqueeze(1))                         # (B*T, 1, d_model)
+            toks.append(tok.unsqueeze(1))
 
         tokens = torch.cat(
             [self.cls_token.expand(B * T, -1, -1)] + toks, dim=1)
@@ -168,17 +161,6 @@ class DualTransformer(nn.Module):
     """
     Input  : (B, T, 346)
     Output : (B, num_classes)
-
-    Luồng:
-      SpatialTransformer (5 groups + soft gate) → (B, T, D)
-      TemporalTransformer                        → (B, D)
-      mean(spatial) + temporal CLS → concat      → (B, 2D)
-      MLP classifier                             → (B, num_classes)
-
-    Soft gate giúp model tự học:
-      Ký hiệu thuần tay   : gate_interact≈0.2, gate_hand≈0.9
-      Ký hiệu chạm mặt   : gate_interact≈0.7, gate_face≈0.6
-      Ký hiệu chạm cằm/má: gate_interact≈0.8 (phân biệt ba/má)
     """
     def __init__(self, feat_dim: int, seq_len: int,
                  num_classes: int, config=cfg):
@@ -206,30 +188,18 @@ class DualTransformer(nn.Module):
         return self.classifier(torch.cat([s.mean(1), t], dim=-1))
 
     def forward_with_gates(self, x: torch.Tensor):
-        """
-        Dùng để visualize gate values trong realtime hoặc báo cáo.
-
-        Returns:
-            logits   : (B, num_classes)
-            gate_dict: {'pose': 0.45, 'face': 0.30,
-                        'left_hand': 0.80, 'right_hand': 0.75,
-                        'interact': 0.65}
-        """
         s, gate_vals = self.spatial(x, return_gates=True)
         t            = self.temporal(s)
         logits       = self.classifier(torch.cat([s.mean(1), t], dim=-1))
         gate_dict    = dict(zip(SpatialTransformer.get_gate_names(), gate_vals))
         return logits, gate_dict
 
+
 # ═══════════════════════════════════════════════════════════
 # HELPER: Load checkpoint
 # ═══════════════════════════════════════════════════════════
 
 def load_model(checkpoint_path: str, device: str = cfg.DEVICE):
-    """
-    Load DualTransformer từ checkpoint .pt.
-    Trả về (model, label_map, epoch, val_acc)
-    """
     import os
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(

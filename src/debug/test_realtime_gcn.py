@@ -86,7 +86,7 @@ class VSLGCNTester:
         except Exception:
             print("⚠️ Trying with custom_objects...")
             try:
-                from train_gcn import GraphConv, STGCN_Block
+                from src.debug.train_gcn import GraphConv, STGCN_Block
                 self.model = tf.keras.models.load_model(
                     model_path,
                     custom_objects={'GraphConv': GraphConv, 'STGCN_Block': STGCN_Block}
