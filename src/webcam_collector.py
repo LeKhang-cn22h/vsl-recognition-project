@@ -15,21 +15,70 @@ Menu:
 import cv2
 import json
 import os
+import sys
 import time
+import traceback
+import logging
 import urllib.request
 from datetime import datetime
 
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
+# ══════════════════════════════════════════════════════════
+# LOGGING SETUP — ghi ra console VÀ file log
+# ══════════════════════════════════════════════════════════
 
-from collector import (
-    init_hf, upload_to_hf,
-    FullBodyDrawer, draw_text_bg, lm_to_px,
-    FramingChecker,
-    FacialExpressionAnalyzer,
-    InteractionVisualizer,
+LOG_FILE = "webcam_collector.log"
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8", mode="w"),
+        logging.StreamHandler(sys.stdout),   # in ra terminal
+    ]
 )
+log = logging.getLogger(__name__)
+
+def _log_exception(label: str, exc: Exception):
+    """In traceback đầy đủ ra log."""
+    log.error(f"[LỖI] {label}: {exc}")
+    log.error(traceback.format_exc())
+
+# ══════════════════════════════════════════════════════════
+# IMPORT KIỂM TRA TỪNG BƯỚC
+# ══════════════════════════════════════════════════════════
+
+log.info("=== BẮT ĐẦU KHỞI ĐỘNG webcam_collector.py ===")
+log.info(f"Python: {sys.version}")
+log.info(f"Thư mục làm việc: {os.getcwd()}")
+
+# -- mediapipe --
+try:
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
+    log.info(f"  mediapipe OK — phiên bản: {mp.__version__}")
+except ImportError as e:
+    _log_exception("Import mediapipe", e)
+    log.critical("Thiếu mediapipe! Chạy: pip install mediapipe")
+    sys.exit(1)
+
+# -- collector --
+try:
+    from collector import (
+        init_hf, upload_to_hf,
+        FullBodyDrawer, draw_text_bg, lm_to_px,
+        FramingChecker,
+        FacialExpressionAnalyzer,
+        InteractionVisualizer,
+    )
+    log.info("  collector OK")
+except ImportError as e:
+    _log_exception("Import collector", e)
+    log.critical("Không tìm thấy module 'collector'. Kiểm tra thư mục dự án!")
+    sys.exit(1)
+except Exception as e:
+    _log_exception("Lỗi khi import collector", e)
+    sys.exit(1)
 
 # ── Download MediaPipe models ──────────────────────────────
 
@@ -47,9 +96,16 @@ MODEL_URLS = {
 
 def download_model(filename):
     if os.path.exists(filename):
+        log.info(f"  Model '{filename}' đã có sẵn, bỏ qua tải.")
         return filename
+    log.info(f"  Đang tải {filename} ...")
     print(f"  Dang tai {filename} ...")
-    urllib.request.urlretrieve(MODEL_URLS[filename], filename)
+    try:
+        urllib.request.urlretrieve(MODEL_URLS[filename], filename)
+        log.info(f"  Tải '{filename}' thành công.")
+    except Exception as e:
+        _log_exception(f"Tải model {filename}", e)
+        raise
     return filename
 
 
@@ -60,100 +116,153 @@ def download_model(filename):
 class WebcamVideoCollector:
 
     # Hằng số điều khiển auto mode
-    COUNTDOWN_SECS         = 5
+    COUNTDOWN_SECS         = 3
     RELAXED_FRAMES_TO_STOP = 15   # ~0.5s @ 30fps
     COOLDOWN_SECS          = 2.0
 
     def __init__(self, output_dir='data/videos'):
+        log.info(f"Khởi tạo WebcamVideoCollector, output_dir='{output_dir}'")
         self.output_dir    = output_dir
         self.metadata_path = os.path.join(output_dir, 'metadata.json')
         os.makedirs(output_dir, exist_ok=True)
         self.metadata = self._load_meta()
 
-        init_hf()   # Khởi tạo HuggingFace upload
+        # Khởi tạo HuggingFace
+        try:
+            init_hf()
+            log.info("  HuggingFace init OK")
+        except Exception as e:
+            _log_exception("init_hf", e)
+            log.warning("  HuggingFace init thất bại — tiếp tục không upload")
 
         print("\n" + "="*60)
         print(" KHOI TAO MEDIAPIPE DETECTORS ".center(60))
         print("="*60)
 
-        hand_m = download_model('hand_landmarker.task')
-        pose_m = download_model('pose_landmarker_heavy.task')
-        face_m = download_model('face_landmarker.task')
+        # Tải models
+        try:
+            hand_m = download_model('hand_landmarker.task')
+            pose_m = download_model('pose_landmarker_heavy.task')
+            face_m = download_model('face_landmarker.task')
+        except Exception as e:
+            _log_exception("Tải model MediaPipe", e)
+            raise
 
         # Kết quả callback lưu vào đây, main loop đọc ra
         self._latest = dict(pose=None, face=None, hands=None, blendshapes=None)
         self._ts = 0
 
-        print("  Khoi tao PoseLandmarker ...")
-        self.pose_detector = mp_vision.PoseLandmarker.create_from_options(
-            mp_vision.PoseLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=pose_m),
-                running_mode=mp_vision.RunningMode.LIVE_STREAM,
-                num_poses=1,
-                min_pose_detection_confidence=0.5,
-                min_pose_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
-                result_callback=self._on_pose))
+        # Khởi tạo PoseLandmarker
+        try:
+            log.info("  Khởi tạo PoseLandmarker ...")
+            print("  Khoi tao PoseLandmarker ...")
+            self.pose_detector = mp_vision.PoseLandmarker.create_from_options(
+                mp_vision.PoseLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=pose_m),
+                    running_mode=mp_vision.RunningMode.LIVE_STREAM,
+                    num_poses=1,
+                    min_pose_detection_confidence=0.5,
+                    min_pose_presence_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    result_callback=self._on_pose))
+            log.info("  PoseLandmarker OK")
+        except Exception as e:
+            _log_exception("Khởi tạo PoseLandmarker", e)
+            raise
 
-        print("  Khoi tao HandLandmarker ...")
-        self.hand_detector = mp_vision.HandLandmarker.create_from_options(
-            mp_vision.HandLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=hand_m),
-                running_mode=mp_vision.RunningMode.LIVE_STREAM,
-                num_hands=2,
-                min_hand_detection_confidence=0.5,
-                min_hand_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
-                result_callback=self._on_hand))
+        # Khởi tạo HandLandmarker
+        try:
+            log.info("  Khởi tạo HandLandmarker ...")
+            print("  Khoi tao HandLandmarker ...")
+            self.hand_detector = mp_vision.HandLandmarker.create_from_options(
+                mp_vision.HandLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=hand_m),
+                    running_mode=mp_vision.RunningMode.LIVE_STREAM,
+                    num_hands=2,
+                    min_hand_detection_confidence=0.5,
+                    min_hand_presence_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    result_callback=self._on_hand))
+            log.info("  HandLandmarker OK")
+        except Exception as e:
+            _log_exception("Khởi tạo HandLandmarker", e)
+            raise
 
-        print("  Khoi tao FaceLandmarker (+ Blendshapes) ...")
-        self.face_detector = mp_vision.FaceLandmarker.create_from_options(
-            mp_vision.FaceLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=face_m),
-                running_mode=mp_vision.RunningMode.LIVE_STREAM,
-                num_faces=1,
-                min_face_detection_confidence=0.5,
-                min_face_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
-                output_face_blendshapes=True,
-                result_callback=self._on_face))
+        # Khởi tạo FaceLandmarker
+        try:
+            log.info("  Khởi tạo FaceLandmarker ...")
+            print("  Khoi tao FaceLandmarker (+ Blendshapes) ...")
+            self.face_detector = mp_vision.FaceLandmarker.create_from_options(
+                mp_vision.FaceLandmarkerOptions(
+                    base_options=mp_python.BaseOptions(model_asset_path=face_m),
+                    running_mode=mp_vision.RunningMode.LIVE_STREAM,
+                    num_faces=1,
+                    min_face_detection_confidence=0.5,
+                    min_face_presence_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    output_face_blendshapes=True,
+                    result_callback=self._on_face))
+            log.info("  FaceLandmarker OK")
+        except Exception as e:
+            _log_exception("Khởi tạo FaceLandmarker", e)
+            raise
 
+        log.info("  Tất cả detector đã sẵn sàng!")
         print("  Tat ca detector da san sang!\n")
 
     # ── MediaPipe callbacks ───────────────────────────────
 
     def _on_pose(self, result, image, ts):
-        self._latest['pose'] = (result.pose_landmarks[0]
-                                if result.pose_landmarks else None)
+        try:
+            self._latest['pose'] = (result.pose_landmarks[0]
+                                    if result.pose_landmarks else None)
+        except Exception as e:
+            _log_exception("_on_pose callback", e)
 
     def _on_hand(self, result, image, ts):
-        left = right = None
-        if result.hand_landmarks and result.handedness:
-            for i, hlms in enumerate(result.hand_landmarks):
-                cat = result.handedness[i][0].category_name
-                if cat == 'Left': right = hlms
-                else:             left  = hlms
-        self._latest['hands'] = (left, right)
+        try:
+            left = right = None
+            if result.hand_landmarks and result.handedness:
+                for i, hlms in enumerate(result.hand_landmarks):
+                    cat = result.handedness[i][0].category_name
+                    if cat == 'Left': right = hlms
+                    else:             left  = hlms
+            self._latest['hands'] = (left, right)
+        except Exception as e:
+            _log_exception("_on_hand callback", e)
 
     def _on_face(self, result, image, ts):
-        self._latest['face'] = (result.face_landmarks[0]
-                                if result.face_landmarks else None)
-        self._latest['blendshapes'] = (result.face_blendshapes[0]
-                                       if result.face_blendshapes else None)
+        try:
+            self._latest['face'] = (result.face_landmarks[0]
+                                    if result.face_landmarks else None)
+            self._latest['blendshapes'] = (result.face_blendshapes[0]
+                                           if result.face_blendshapes else None)
+        except Exception as e:
+            _log_exception("_on_face callback", e)
 
     # ── Metadata ─────────────────────────────────────────
 
     def _load_meta(self):
         if os.path.exists(self.metadata_path):
-            with open(self.metadata_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            try:
+                with open(self.metadata_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                log.info(f"  Đã tải metadata: {self.metadata_path}")
+                return data
+            except Exception as e:
+                _log_exception("Đọc metadata.json", e)
+                log.warning("  metadata.json bị lỗi — tạo mới")
         return dict(labels={}, total_videos=0,
                     created_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
     def _save_meta(self):
         self.metadata['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        with open(self.metadata_path, 'w', encoding='utf-8') as f:
-            json.dump(self.metadata, f, indent=2, ensure_ascii=False)
+        try:
+            with open(self.metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(self.metadata, f, indent=2, ensure_ascii=False)
+            log.info(f"  Đã lưu metadata: {self.metadata_path}")
+        except Exception as e:
+            _log_exception("Lưu metadata.json", e)
 
     # ── Display names ─────────────────────────────────────
 
@@ -165,14 +274,18 @@ class WebcamVideoCollector:
         path = self._dn_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         dn = {}
-        if os.path.exists(path):
-            with open(path, 'r', encoding='utf-8') as f:
-                dn = json.load(f)
-        if label_key not in dn:
-            dn[label_key] = viet_name
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(dn, f, indent=2, ensure_ascii=False)
-            print(f"  Da luu: '{label_key}' → '{viet_name}'")
+        try:
+            if os.path.exists(path):
+                with open(path, 'r', encoding='utf-8') as f:
+                    dn = json.load(f)
+            if label_key not in dn:
+                dn[label_key] = viet_name
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(dn, f, indent=2, ensure_ascii=False)
+                log.info(f"  Đã lưu display_name: '{label_key}' → '{viet_name}'")
+                print(f"  Da luu: '{label_key}' → '{viet_name}'")
+        except Exception as e:
+            _log_exception("_save_display_name", e)
 
     # ── Statistics ────────────────────────────────────────
 
@@ -205,7 +318,6 @@ class WebcamVideoCollector:
         if pose_lms is None:
             return False
 
-        # Tính hip_y
         hip_y = None
         if pose_lms[23].visibility > 0.4 and pose_lms[24].visibility > 0.4:
             hip_y = (pose_lms[23].y + pose_lms[24].y) / 2
@@ -230,59 +342,68 @@ class WebcamVideoCollector:
     # ── UI helpers ────────────────────────────────────────
 
     def _draw_warnings(self, frame, fr, w, h):
-        if fr['ok']:
-            cv2.rectangle(frame, (2,2), (w-2,h-2), (0,255,0), 3)
-            draw_text_bg(frame, "GOC QUAY: OK", (10, h-60),
-                         scale=0.6, color=(0,255,0), bg=(0,50,0))
-        else:
-            cv2.rectangle(frame, (2,2), (w-2,h-2), (0,0,255), 4)
-            y = h - 60 - (len(fr['warnings'])-1)*30
-            for w_txt in fr['warnings']:
-                draw_text_bg(frame, f"! {w_txt}", (10, y),
-                             scale=0.55, color=(0,0,255), bg=(50,0,0))
-                y += 30
+        try:
+            if fr['ok']:
+                cv2.rectangle(frame, (2,2), (w-2,h-2), (0,255,0), 3)
+                draw_text_bg(frame, "GOC QUAY: OK", (10, h-60),
+                             scale=0.6, color=(0,255,0), bg=(0,50,0))
+            else:
+                cv2.rectangle(frame, (2,2), (w-2,h-2), (0,0,255), 4)
+                y = h - 60 - (len(fr['warnings'])-1)*30
+                for w_txt in fr['warnings']:
+                    draw_text_bg(frame, f"! {w_txt}", (10, y),
+                                 scale=0.55, color=(0,0,255), bg=(50,0,0))
+                    y += 30
 
-        det = fr['details']
-        items = [('Mat', det['face_visible']),
-                 ('Than', det['upper_body_visible']),
-                 ('Tay T', det['left_arm_visible']),
-                 ('Tay P', det['right_arm_visible']),
-                 ('Ban tay T', det['left_hand_visible']),
-                 ('Ban tay P', det['right_hand_visible'])]
-        x0 = w - 130
-        for i, (nm, ok) in enumerate(items):
-            c = (0,255,0) if ok else (0,0,255)
-            cv2.putText(frame, f"{'[OK]' if ok else '[X] '} {nm}",
-                        (x0, 70+i*22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1)
+            det = fr['details']
+            items = [('Mat', det['face_visible']),
+                     ('Than', det['upper_body_visible']),
+                     ('Tay T', det['left_arm_visible']),
+                     ('Tay P', det['right_arm_visible']),
+                     ('Ban tay T', det['left_hand_visible']),
+                     ('Ban tay P', det['right_hand_visible'])]
+            x0 = w - 130
+            for i, (nm, ok) in enumerate(items):
+                c = (0,255,0) if ok else (0,0,255)
+                cv2.putText(frame, f"{'[OK]' if ok else '[X] '} {nm}",
+                            (x0, 70+i*22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1)
+        except Exception as e:
+            _log_exception("_draw_warnings", e)
 
     def _draw_expression(self, frame, expr, w, h):
-        if expr is None:
-            return
-        px, py = 10, 70
-        src = expr.get('source', '?')
-        draw_text_bg(frame,
-                     f"Bieu cam: {expr['expression_label']} [{src}]",
-                     (px, py), scale=0.55, color=(255,255,0), bg=(40,40,40))
-        lines = [
-            f"Mieng: {'Mo' if expr['mouth_open']>0.3 else 'Dong'} "
-            f"({expr['mouth_open']:.2f})  Cuoi:{expr['mouth_smile']:.2f}",
-            f"Mat T:{expr['left_eye_open']:.2f}  Mat P:{expr['right_eye_open']:.2f}"
-            f"  Wide:{expr.get('eye_wide',0):.2f}  Squint:{expr.get('eye_squint',0):.2f}",
-            f"May len:{expr.get('brow_up',0):.2f}  May xuong:{expr.get('brow_down',0):.2f}",
-        ]
-        for i, t in enumerate(lines):
-            cv2.putText(frame, t, (px, py+22+i*17),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.37, (200,200,200), 1)
+        try:
+            if expr is None:
+                return
+            px, py = 10, 70
+            src = expr.get('source', '?')
+            draw_text_bg(frame,
+                         f"Bieu cam: {expr['expression_label']} [{src}]",
+                         (px, py), scale=0.55, color=(255,255,0), bg=(40,40,40))
+            lines = [
+                f"Mieng: {'Mo' if expr['mouth_open']>0.3 else 'Dong'} "
+                f"({expr['mouth_open']:.2f})  Cuoi:{expr['mouth_smile']:.2f}",
+                f"Mat T:{expr['left_eye_open']:.2f}  Mat P:{expr['right_eye_open']:.2f}"
+                f"  Wide:{expr.get('eye_wide',0):.2f}  Squint:{expr.get('eye_squint',0):.2f}",
+                f"May len:{expr.get('brow_up',0):.2f}  May xuong:{expr.get('brow_down',0):.2f}",
+            ]
+            for i, t in enumerate(lines):
+                cv2.putText(frame, t, (px, py+22+i*17),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.37, (200,200,200), 1)
+        except Exception as e:
+            _log_exception("_draw_expression", e)
 
     def _draw_interactions(self, frame, interactions, w, h):
-        if not interactions:
-            return
-        y = 195
-        draw_text_bg(frame, "TUONG TAC:", (10, y),
-                     scale=0.55, color=(0,255,255), bg=(40,40,40))
-        for i, txt in enumerate(interactions):
-            cv2.putText(frame, f">> {txt}", (10, y+22+i*20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,200,255), 1)
+        try:
+            if not interactions:
+                return
+            y = 195
+            draw_text_bg(frame, "TUONG TAC:", (10, y),
+                         scale=0.55, color=(0,255,255), bg=(40,40,40))
+            for i, txt in enumerate(interactions):
+                cv2.putText(frame, f">> {txt}", (10, y+22+i*20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,200,255), 1)
+        except Exception as e:
+            _log_exception("_draw_interactions", e)
 
     # ── STATE DISPLAY helpers ─────────────────────────────
 
@@ -313,8 +434,7 @@ class WebcamVideoCollector:
                       (bar_x+int(bar_w*(elapsed_cd/self.COUNTDOWN_SECS)), bar_y+12),
                       num_color, -1)
 
-    def _draw_recording(self, frame, w, h, elapsed, frame_count,
-                         relaxed_cnt):
+    def _draw_recording(self, frame, w, h, elapsed, frame_count, relaxed_cnt):
         cv2.putText(frame, f"REC {elapsed:.1f}s | {frame_count}f",
                     (w//2-80, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
         if int(elapsed*2) % 2 == 0:
@@ -336,8 +456,13 @@ class WebcamVideoCollector:
     # ══════════════════════════════════════════════════════
 
     def collect_label(self, label_name: str):
-        cap = cv2.VideoCapture(0)
+        log.info(f"collect_label bắt đầu: '{label_name}'")
+
+        # ── Kiểm tra webcam ──
+        log.info("  Đang mở webcam (index 0)...")
+        cap = cv2.VideoCapture(1)
         if not cap.isOpened():
+            log.error("  Không thể mở webcam! Kiểm tra kết nối camera.")
             print("  Khong the mo webcam!")
             return
 
@@ -346,13 +471,14 @@ class WebcamVideoCollector:
         fps    = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        log.info(f"  Webcam mở OK — {width}x{height}@{fps}fps")
 
         label_dir = os.path.join(self.output_dir, label_name)
         os.makedirs(label_dir, exist_ok=True)
         video_count = len([f for f in os.listdir(label_dir)
                            if f.endswith('.mp4')])
+        log.info(f"  label_dir='{label_dir}', video hiện có: {video_count}")
 
-        # ── State machine: idle → countdown → recording → idle ──
         state          = 'idle'
         video_writer   = None
         frame_count    = 0
@@ -369,23 +495,35 @@ class WebcamVideoCollector:
         print("  [SPACE] Thu cong  [A] Auto  [M] Mesh  [Q] Thoat\n")
 
         self._ts = 0
+        frame_idx = 0  # để log tần suất thấp
 
         while True:
             ret, frame = cap.read()
-            if not ret: break
+            if not ret:
+                log.warning("  cap.read() trả về False — mất kết nối webcam?")
+                break
+
+            frame_idx += 1
+            if frame_idx % 300 == 0:   # mỗi ~10 giây
+                log.debug(f"  Vòng lặp chính: frame #{frame_idx}, state={state}")
 
             frame       = cv2.flip(frame, 1)
-            clean_frame = frame.copy()   # frame GỐC để ghi video (không overlay)
+            clean_frame = frame.copy()
             h, w        = frame.shape[:2]
             now         = time.time()
 
             # ── Gửi đến MediaPipe ──
             self._ts += 33
-            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
-                              data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            for det in [self.pose_detector, self.hand_detector, self.face_detector]:
-                try: det.detect_async(mp_img, self._ts)
-                except Exception: pass
+            try:
+                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                  data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                for det in [self.pose_detector, self.hand_detector, self.face_detector]:
+                    try:
+                        det.detect_async(mp_img, self._ts)
+                    except Exception as e:
+                        _log_exception(f"detect_async (ts={self._ts})", e)
+            except Exception as e:
+                _log_exception("Tạo mp.Image", e)
 
             # ── Đọc kết quả ──
             pose_lms  = self._latest['pose']
@@ -394,27 +532,50 @@ class WebcamVideoCollector:
             left_h, right_h = self._latest['hands'] or (None, None)
 
             # ── Vẽ keypoints ──
-            FullBodyDrawer.draw_pose(frame, pose_lms, w, h)
-            if show_mesh:
-                FullBodyDrawer.draw_face_mesh(frame, face_lms, w, h)
-            FullBodyDrawer.draw_hand(frame, left_h,  w, h, 'L')
-            FullBodyDrawer.draw_hand(frame, right_h, w, h, 'R')
+            try:
+                FullBodyDrawer.draw_pose(frame, pose_lms, w, h)
+                if show_mesh:
+                    FullBodyDrawer.draw_face_mesh(frame, face_lms, w, h)
+                FullBodyDrawer.draw_hand(frame, left_h,  w, h, 'L')
+                FullBodyDrawer.draw_hand(frame, right_h, w, h, 'R')
+            except Exception as e:
+                _log_exception("Vẽ keypoints", e)
 
             # ── Phân tích ──
-            framing = FramingChecker.check(
-                pose_lms, face_lms, (left_h, right_h), w, h)
-            self._draw_warnings(frame, framing, w, h)
+            try:
+                framing = FramingChecker.check(
+                    pose_lms, face_lms, (left_h, right_h), w, h)
+                self._draw_warnings(frame, framing, w, h)
+            except Exception as e:
+                _log_exception("FramingChecker.check", e)
+                framing = {'ok': False, 'warnings': ['Loi phan tich'], 'details': {
+                    'face_visible': False, 'upper_body_visible': False,
+                    'left_arm_visible': False, 'right_arm_visible': False,
+                    'left_hand_visible': False, 'right_hand_visible': False,
+                }}
 
-            expr = (FacialExpressionAnalyzer.analyze_blendshapes(blends)
-                    if blends else
-                    FacialExpressionAnalyzer.analyze_landmarks(face_lms, w, h))
-            self._draw_expression(frame, expr, w, h)
+            try:
+                expr = (FacialExpressionAnalyzer.analyze_blendshapes(blends)
+                        if blends else
+                        FacialExpressionAnalyzer.analyze_landmarks(face_lms, w, h))
+                self._draw_expression(frame, expr, w, h)
+            except Exception as e:
+                _log_exception("FacialExpressionAnalyzer", e)
+                expr = None
 
-            frame, interactions = InteractionVisualizer.draw(
-                frame, pose_lms, face_lms, left_h, right_h, w, h)
-            self._draw_interactions(frame, interactions, w, h)
+            try:
+                frame, interactions = InteractionVisualizer.draw(
+                    frame, pose_lms, face_lms, left_h, right_h, w, h)
+                self._draw_interactions(frame, interactions, w, h)
+            except Exception as e:
+                _log_exception("InteractionVisualizer.draw", e)
+                interactions = []
 
-            relaxed = self._hands_relaxed(pose_lms, left_h, right_h)
+            try:
+                relaxed = self._hands_relaxed(pose_lms, left_h, right_h)
+            except Exception as e:
+                _log_exception("_hands_relaxed", e)
+                relaxed = True
 
             # ══════════════════════════════════════════════
             # STATE MACHINE
@@ -426,34 +587,48 @@ class WebcamVideoCollector:
                         state = 'countdown'
                         countdown_start = now
                         relaxed_cnt = 0
+                        log.info(f"  AUTO: idle → countdown (video #{video_count+1})")
                         print(f"  Auto: OK → dem nguoc {self.COUNTDOWN_SECS}s...")
 
                 elif state == 'countdown':
                     elapsed_cd = now - countdown_start
                     if elapsed_cd >= self.COUNTDOWN_SECS:
-                        state, fp, video_writer, frame_count, start_time = \
-                            self._start_recording(label_name, label_dir,
-                                                  video_count, fps, width, height, now)
-                        print(f"  Auto: BAT DAU video {video_count+1}")
+                        try:
+                            state, fp, video_writer, frame_count, start_time = \
+                                self._start_recording(label_name, label_dir,
+                                                      video_count, fps, width, height, now)
+                            log.info(f"  AUTO: countdown → recording → '{fp}'")
+                            print(f"  Auto: BAT DAU video {video_count+1}")
+                        except Exception as e:
+                            _log_exception("_start_recording (auto)", e)
+                            state = 'idle'
                     elif not framing['ok'] or relaxed:
+                        log.info("  AUTO: countdown → idle (huỷ)")
                         state = 'idle'
                         print("  Auto: Huy dem nguoc")
 
                 elif state == 'recording':
                     relaxed_cnt = relaxed_cnt + 1 if relaxed else 0
                     if relaxed_cnt >= self.RELAXED_FRAMES_TO_STOP:
-                        video_count, last_stop_time = \
-                            self._stop_recording(video_writer, video_count,
-                                                 frame_count, now - start_time,
-                                                 fp, label_name, now)
+                        try:
+                            video_count, last_stop_time = \
+                                self._stop_recording(video_writer, video_count,
+                                                     frame_count, now - start_time,
+                                                     fp, label_name, now)
+                            log.info(f"  AUTO: recording dừng, total={video_count}")
+                        except Exception as e:
+                            _log_exception("_stop_recording (auto)", e)
                         video_writer = None
                         state = 'idle'
                         relaxed_cnt = 0
 
             # Ghi frame GỐC (không overlay)
             if state == 'recording' and video_writer:
-                video_writer.write(clean_frame)
-                frame_count += 1
+                try:
+                    video_writer.write(clean_frame)
+                    frame_count += 1
+                except Exception as e:
+                    _log_exception("video_writer.write", e)
 
             # ══════════════════════════════════════════════
             # HEADER + STATE DISPLAY
@@ -476,11 +651,17 @@ class WebcamVideoCollector:
                 num_color  = ((0,0,255) if elapsed_cd > self.COUNTDOWN_SECS - 2
                               else (0,165,255) if elapsed_cd > self.COUNTDOWN_SECS - 3
                               else (0,255,0))
-                self._draw_countdown(frame, w, h, elapsed_cd, num_color)
+                try:
+                    self._draw_countdown(frame, w, h, elapsed_cd, num_color)
+                except Exception as e:
+                    _log_exception("_draw_countdown", e)
 
             elif state == 'recording':
-                self._draw_recording(frame, w, h,
-                                     now - start_time, frame_count, relaxed_cnt)
+                try:
+                    self._draw_recording(frame, w, h,
+                                         now - start_time, frame_count, relaxed_cnt)
+                except Exception as e:
+                    _log_exception("_draw_recording", e)
 
             elif state == 'idle':
                 in_cooldown = (now - last_stop_time) < self.COOLDOWN_SECS
@@ -498,13 +679,11 @@ class WebcamVideoCollector:
                                 (w//2-120, 25), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55, (0,255,0), 1)
 
-            # Relaxed indicator
             cv2.putText(frame,
                         "Tay: THA LONG" if relaxed else "Tay: GIO LEN",
                         (w-160, h-40), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                         (100,100,255) if relaxed else (0,255,100), 1)
 
-            # Footer
             cv2.rectangle(frame, (0,h-30), (w,h), (30,30,30), -1)
             cv2.putText(frame,
                         "[SPACE] Thu cong  |  [A] Auto  |  [M] Mesh  |  [Q] Thoat",
@@ -517,16 +696,25 @@ class WebcamVideoCollector:
 
             if key == ord(' '):
                 if state != 'recording':
-                    state = 'recording'
-                    fp, video_writer, frame_count, start_time = \
-                        self._start_recording_manual(
-                            label_name, label_dir, video_count, fps, width, height)
-                    relaxed_cnt = 0
-                    print(f"  Thu cong: BAT DAU video {video_count+1}")
+                    try:
+                        state = 'recording'
+                        fp, video_writer, frame_count, start_time = \
+                            self._start_recording_manual(
+                                label_name, label_dir, video_count, fps, width, height)
+                        relaxed_cnt = 0
+                        log.info(f"  THU CÔNG: bắt đầu video {video_count+1} → '{fp}'")
+                        print(f"  Thu cong: BAT DAU video {video_count+1}")
+                    except Exception as e:
+                        _log_exception("_start_recording_manual", e)
+                        state = 'idle'
                 else:
-                    video_count, last_stop_time = self._stop_recording(
-                        video_writer, video_count, frame_count,
-                        time.time() - start_time, fp, label_name, time.time())
+                    try:
+                        video_count, last_stop_time = self._stop_recording(
+                            video_writer, video_count, frame_count,
+                            time.time() - start_time, fp, label_name, time.time())
+                        log.info(f"  THU CÔNG: dừng, total={video_count}")
+                    except Exception as e:
+                        _log_exception("_stop_recording (manual)", e)
                     video_writer = None
                     state = 'idle'
                     relaxed_cnt = 0
@@ -535,22 +723,25 @@ class WebcamVideoCollector:
                 auto_mode = not auto_mode
                 if not auto_mode and state == 'countdown':
                     state = 'idle'
+                log.info(f"  Auto mode: {'ON' if auto_mode else 'OFF'}")
                 print(f"  Auto: {'ON' if auto_mode else 'OFF'}")
 
             elif key in (ord('m'), ord('M')):
                 show_mesh = not show_mesh
 
             elif key in (ord('q'), ord('Q')):
+                log.info("  Người dùng nhấn Q — thoát collect_label")
                 if state == 'recording' and video_writer:
                     video_writer.release()
                     video_count += 1
+                    log.info(f"  Giải phóng video_writer, total={video_count}")
                 break
 
         cap.release()
         cv2.destroyAllWindows()
         self._ts = 0
+        log.info(f"  collect_label kết thúc: {video_count} video")
 
-        # Cập nhật metadata
         self.metadata['labels'][label_name] = dict(
             num_videos=video_count, path=label_dir)
         self.metadata['total_videos'] = sum(
@@ -567,23 +758,34 @@ class WebcamVideoCollector:
     def _start_recording(self, label_name, label_dir,
                           video_count, fps, width, height, now):
         fp = self._make_video_path(label_name, label_dir, video_count)
+        log.info(f"    Tạo VideoWriter: '{fp}' — {width}x{height}@{fps}")
         vw = cv2.VideoWriter(fp, cv2.VideoWriter_fourcc(*'mp4v'),
                              fps, (width, height))
+        if not vw.isOpened():
+            log.error(f"    VideoWriter KHÔNG mở được cho '{fp}'!")
         return 'recording', fp, vw, 0, now
 
     def _start_recording_manual(self, label_name, label_dir,
                                  video_count, fps, width, height):
         fp = self._make_video_path(label_name, label_dir, video_count)
+        log.info(f"    Tạo VideoWriter (manual): '{fp}'")
         vw = cv2.VideoWriter(fp, cv2.VideoWriter_fourcc(*'mp4v'),
                              fps, (width, height))
+        if not vw.isOpened():
+            log.error(f"    VideoWriter KHÔNG mở được cho '{fp}'!")
         return fp, vw, 0, time.time()
 
     def _stop_recording(self, video_writer, video_count,
                          frame_count, duration, fp, label_name, now):
+        log.info(f"    Dừng ghi: {frame_count} frames, {duration:.1f}s → '{fp}'")
         video_writer.release()
         video_count += 1
         print(f"  DUNG video {video_count} ({frame_count}f, {duration:.1f}s)")
-        upload_to_hf(fp, label_name, split="train")
+        try:
+            upload_to_hf(fp, label_name, split="train")
+            log.info(f"    Upload HF OK: '{fp}'")
+        except Exception as e:
+            _log_exception("upload_to_hf", e)
         return video_count, now
 
     # ══════════════════════════════════════════════════════
@@ -591,6 +793,7 @@ class WebcamVideoCollector:
     # ══════════════════════════════════════════════════════
 
     def interactive_menu(self):
+        log.info("Vào interactive_menu")
         while True:
             print("\n" + "="*60)
             print(" VSL COLLECTOR - MediaPipe Tasks API ".center(60, "="))
@@ -604,6 +807,7 @@ class WebcamVideoCollector:
             print("="*60)
 
             ch = input("\n  Chon (1-6): ").strip()
+            log.info(f"  Menu: người dùng chọn '{ch}'")
 
             if ch == "1":
                 self.show_statistics()
@@ -646,13 +850,13 @@ class WebcamVideoCollector:
                 self._save_meta()
                 self.show_statistics()
                 self._ask_organize_on_exit()
+                log.info("Thoát chương trình")
                 print("\n  Tam biet!\n")
                 break
             else:
                 print("  Khong hop le!")
 
     def _menu_idle(self):
-        """Sub-menu thu video IDLE."""
         idle_actions = [
             ("tay_xuoi_hong",     "Tay xuoi ben hong dung yen"),
             ("tay_khoanh_nguc",   "Tay khoanh truoc nguc"),
@@ -716,16 +920,12 @@ class WebcamVideoCollector:
     # ══════════════════════════════════════════════════════
 
     def _pick_files_gui(self) -> list[str]:
-        """
-        Mở hộp thoại chọn file bằng tkinter.
-        Trả về list đường dẫn, hoặc [] nếu không có tkinter.
-        """
         try:
             import tkinter as tk
             from tkinter import filedialog
             root = tk.Tk()
-            root.withdraw()          # ẩn cửa sổ tkinter chính
-            root.attributes('-topmost', True)   # hiện hộp thoại lên trên
+            root.withdraw()
+            root.attributes('-topmost', True)
             paths = filedialog.askopenfilenames(
                 title      = "Chon file video de upload",
                 filetypes  = [
@@ -735,28 +935,27 @@ class WebcamVideoCollector:
             )
             root.destroy()
             return list(paths)
-        except Exception:
-            return []   # fallback về nhập tay
+        except Exception as e:
+            _log_exception("_pick_files_gui", e)
+            return []
 
     def _menu_upload_files(self):
-        """
-        Option 5: Chọn file MP4 từ máy → upload HuggingFace
-                  → hỏi có muốn xử lý → .npy luôn không.
-        """
-        from collector.hf_upload import _hf_api, HF_REPO_ID
+        try:
+            from collector.hf_upload import _hf_api, HF_REPO_ID
+        except ImportError as e:
+            _log_exception("Import collector.hf_upload", e)
+            print("  Loi import hf_upload!"); return
 
         print("\n" + "="*60)
         print(" UPLOAD VIDEO LEN HUGGINGFACE ".center(60))
         print("="*60)
 
-        # ── Kiểm tra HF đã init chưa ──
         if _hf_api is None:
             print("\n  CANH BAO: HuggingFace chua duoc ket noi!")
             print("  Kiem tra file .env co HF_TOKEN va HF_REPO_ID chua.")
             input("\n  Nhan ENTER de quay lai menu...")
             return
 
-        # ── Bước 1: Chọn file ──
         print("\n  Chon file bang:")
         print("  [1] Hop thoai chon file (GUI)")
         print("  [2] Nhap duong dan thu cong")
@@ -770,7 +969,7 @@ class WebcamVideoCollector:
             if not selected_files:
                 print("  (Khong co tkinter hoac khong chon file nao)")
                 print("  Chuyen sang nhap tay...")
-                ch = "2"   # fallback
+                ch = "2"
 
         if ch == "2":
             print("\n  Nhap duong dan file (1 dong 1 file, dong trong de ket thuc):")
@@ -782,7 +981,6 @@ class WebcamVideoCollector:
                     selected_files.append(p)
                     print(f"    ✓ Da them: {os.path.basename(p)}")
                 elif os.path.isdir(p):
-                    # Nếu nhập thư mục → lấy tất cả video trong đó
                     exts = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
                     found = [os.path.join(p, f) for f in sorted(os.listdir(p))
                              if os.path.splitext(f)[1].lower() in exts]
@@ -796,17 +994,12 @@ class WebcamVideoCollector:
             input("  Nhan ENTER de quay lai...")
             return
 
-        # ── Bước 2: Xác nhận danh sách ──
         print(f"\n  Da chon {len(selected_files)} file:")
         for i, fp in enumerate(selected_files, 1):
             size_mb = os.path.getsize(fp) / 1024 / 1024
             print(f"  {i:>3}. {os.path.basename(fp):<45} {size_mb:.1f} MB")
 
-        # ── Bước 3: Nhập label ──
         print("\n  Nhap label cho cac video nay.")
-        print("  (Cac file se duoc upload vao videos/<label>/)")
-
-        # Gợi ý label đang có
         if self.metadata['labels']:
             labels_exist = list(self.metadata['labels'].keys())
             print("\n  Label hien co:")
@@ -828,13 +1021,11 @@ class WebcamVideoCollector:
         if not label_name:
             print("  Ten label rong! Huy."); return
 
-        # Hỏi tên tiếng Việt nếu label mới
         if label_name not in self.metadata.get('labels', {}):
             viet = input(f"  Ten tieng Viet cho '{label_name}': ").strip()
             if viet:
                 self._save_display_name(label_name, viet)
 
-        # ── Bước 4: Xác nhận upload ──
         print(f"\n  Se upload {len(selected_files)} file vao:")
         print(f"  HF repo : {HF_REPO_ID}")
         print(f"  Path    : videos/{label_name}/")
@@ -843,34 +1034,30 @@ class WebcamVideoCollector:
         if confirm != 'y':
             print("  Da huy."); return
 
-        # ── Bước 5: Upload từng file ──
         print(f"\n  Bat dau upload...")
         success = 0
         failed  = []
 
-        # Copy file vào data/videos/<label>/ để đồng bộ với metadata
         label_dir = os.path.join(self.output_dir, label_name)
         os.makedirs(label_dir, exist_ok=True)
 
         for i, fp in enumerate(selected_files, 1):
             fname = os.path.basename(fp)
             print(f"  [{i}/{len(selected_files)}] {fname}...", end=" ", flush=True)
-
-            # Copy vào thư mục local nếu file nằm ngoài
             local_target = os.path.join(label_dir, fname)
             if os.path.abspath(fp) != os.path.abspath(local_target):
                 import shutil
                 shutil.copy2(fp, local_target)
-
-            ok = upload_to_hf(local_target, label_name, split="train")
+            try:
+                ok = upload_to_hf(local_target, label_name, split="train")
+            except Exception as e:
+                _log_exception(f"upload_to_hf({fname})", e)
+                ok = False
             if ok:
-                print("✓")
-                success += 1
+                print("✓"); success += 1
             else:
-                print("✗ (loi)")
-                failed.append(fname)
+                print("✗ (loi)"); failed.append(fname)
 
-        # ── Bước 6: Cập nhật metadata ──
         existing_count = self.metadata['labels'].get(label_name, {}).get('num_videos', 0)
         self.metadata['labels'][label_name] = dict(
             num_videos = existing_count + success,
@@ -880,14 +1067,12 @@ class WebcamVideoCollector:
             v['num_videos'] for v in self.metadata['labels'].values())
         self._save_meta()
 
-        # ── Bước 7: Tổng kết ──
         print(f"\n  Ket qua: {success}/{len(selected_files)} file upload thanh cong")
         if failed:
             print(f"  That bai ({len(failed)} file):")
             for f in failed:
                 print(f"    - {f}")
 
-        # ── Bước 8: Hỏi có muốn xử lý → .npy không ──
         if success > 0:
             print("\n" + "-"*50)
             ans = input(
@@ -899,14 +1084,14 @@ class WebcamVideoCollector:
         input("\n  Nhan ENTER de quay lai menu...")
 
     def _process_uploaded_to_npy(self, video_dir: str, label_name: str):
-        """Gọi video_to_npy pipeline ngay sau khi upload."""
+        log.info(f"_process_uploaded_to_npy: '{label_name}'")
         try:
-            # Import converter (cần video_to_npy.py + converter/ cùng cấp)
             from converter import KeypointNormalizer, resample_sequence, Augmenter
             from vsl.extractor import VideoExtractor
             from vsl.config    import cfg as vsl_cfg
             import numpy as np
         except ImportError as e:
+            _log_exception("Import converter/vsl trong _process_uploaded_to_npy", e)
             print(f"\n  Khong the import converter: {e}")
             print("  Hay chay video_to_npy.py rieng de xu ly.")
             return
@@ -928,55 +1113,58 @@ class WebcamVideoCollector:
         for i, vf in enumerate(videos, 1):
             vpath = os.path.join(video_dir, vf)
             print(f"  [{i}/{len(videos)}] {vf}")
+            try:
+                cap = cv2.VideoCapture(vpath)
+                raw = []
+                while True:
+                    ret, frame = cap.read()
+                    if not ret: break
+                    rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    feats, _ = extractor.extract_frame(rgb)
+                    feats    = KeypointNormalizer.normalize_frame(feats)
+                    raw.append(feats)
+                cap.release()
 
-            import cv2
-            cap = cv2.VideoCapture(vpath)
-            raw = []
-            while True:
-                ret, frame = cap.read()
-                if not ret: break
-                rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                feats, _ = extractor.extract_frame(rgb)
-                feats    = KeypointNormalizer.normalize_frame(feats)
-                raw.append(feats)
-            cap.release()
+                if len(raw) < 5:
+                    log.warning(f"  Video '{vf}' quá ngắn ({len(raw)} frames), bỏ qua")
+                    print(f"    CANH BAO: Qua ngan ({len(raw)} frames). Bo qua.")
+                    continue
 
-            if len(raw) < 5:
-                print(f"    CANH BAO: Qua ngan ({len(raw)} frames). Bo qua.")
-                continue
-
-            normalized  = resample_sequence(raw, vsl_cfg.SEQ_LEN)
-            vid_id      = os.path.splitext(vf)[0]
-            augs        = augmenter.generate(normalized)
-            for suffix, data in augs:
-                fn   = f"{vid_id}_{suffix}.npy"
-                path = os.path.join(output_dir, fn)
-                np.save(path, data.astype(np.float32))
-            print(f"    → {len(augs)} file .npy da luu vao {output_dir}/")
-            success += 1
+                import numpy as np
+                normalized  = resample_sequence(raw, vsl_cfg.SEQ_LEN)
+                vid_id      = os.path.splitext(vf)[0]
+                augs        = augmenter.generate(normalized)
+                for suffix, data in augs:
+                    fn   = f"{vid_id}_{suffix}.npy"
+                    path = os.path.join(output_dir, fn)
+                    np.save(path, data.astype(np.float32))
+                print(f"    → {len(augs)} file .npy da luu vao {output_dir}/")
+                success += 1
+            except Exception as e:
+                _log_exception(f"Xử lý video '{vf}'", e)
 
         extractor.close()
+        log.info(f"_process_uploaded_to_npy hoàn thành: {success}/{len(videos)}")
         print(f"\n  Hoan thanh: {success}/{len(videos)} video da xu ly.")
         print(f"  File .npy tai: data/processed/{label_name}/")
 
     def _ask_organize_on_exit(self):
-        """
-        Hỏi có muốn chia train/val/test trước khi thoát không.
-        Gọi organize_dataset.organize() nếu đồng ý.
-        """
-        # Kiểm tra còn label nào chưa chia không
         video_dir = self.output_dir
         unorganized = []
         skip = {'train', 'val', 'test'}
-        for entry in os.scandir(video_dir):
-            if entry.is_dir() and entry.name not in skip:
-                videos = [f for f in os.listdir(entry.path)
-                          if f.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm'))]
-                if videos:
-                    unorganized.append((entry.name, len(videos)))
+        try:
+            for entry in os.scandir(video_dir):
+                if entry.is_dir() and entry.name not in skip:
+                    videos = [f for f in os.listdir(entry.path)
+                              if f.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm'))]
+                    if videos:
+                        unorganized.append((entry.name, len(videos)))
+        except Exception as e:
+            _log_exception("_ask_organize_on_exit scan", e)
+            return
 
         if not unorganized:
-            return   # Không có gì cần chia
+            return
 
         print("\n" + "="*60)
         print(" CHIA TRAIN / VAL / TEST ".center(60))
@@ -990,7 +1178,6 @@ class WebcamVideoCollector:
             print("  Bo qua. Ban co the chay organize_dataset.py sau.")
             return
 
-        # Gọi organize_dataset
         try:
             import sys
             sys.path.insert(0, os.path.dirname(os.path.dirname(
@@ -999,20 +1186,22 @@ class WebcamVideoCollector:
             stats = organize(src_dir=video_dir, dry_run=False)
             if stats:
                 print(f"\n  Da chia xong {len(stats)} labels!")
-                print(f"  Cau truc moi:")
-                print(f"    {video_dir}/train/<label>/*.mp4")
-                print(f"    {video_dir}/val/<label>/*.mp4")
-                print(f"    {video_dir}/test/<label>/*.mp4")
-        except ImportError:
+        except ImportError as e:
+            _log_exception("Import organize_dataset", e)
             print("\n  Khong tim thay organize_dataset.py")
-            print("  Hay chay: python organize_dataset.py")
         except Exception as e:
-            print(f"\n  Loi khi chia: {e}")
+            _log_exception("organize_dataset.organize", e)
 
     def close(self):
-        self.pose_detector.close()
-        self.hand_detector.close()
-        self.face_detector.close()
+        log.info("Đóng tất cả detector")
+        for name, det in [('pose', self.pose_detector),
+                          ('hand', self.hand_detector),
+                          ('face', self.face_detector)]:
+            try:
+                det.close()
+                log.info(f"  {name}_detector đóng OK")
+            except Exception as e:
+                _log_exception(f"Đóng {name}_detector", e)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1020,11 +1209,31 @@ class WebcamVideoCollector:
 # ══════════════════════════════════════════════════════════
 
 def main():
-    collector = WebcamVideoCollector(output_dir='data/videos')
+    log.info("=== main() bắt đầu ===")
+    try:
+        collector = WebcamVideoCollector(output_dir='data/videos')
+    except Exception as e:
+        _log_exception("Khởi tạo WebcamVideoCollector", e)
+        log.critical("Không thể khởi tạo collector — xem log bên trên.")
+        print(f"\n  LỖI KHỞI TẠO: {e}")
+        print(f"  Chi tiết đã được ghi vào '{LOG_FILE}'")
+        sys.exit(1)
+
     try:
         collector.interactive_menu()
+    except KeyboardInterrupt:
+        log.info("Người dùng nhấn Ctrl+C")
+        print("\n  Thoat (Ctrl+C)")
+    except Exception as e:
+        _log_exception("interactive_menu (uncaught)", e)
+        print(f"\n  LỖI KHÔNG XỬ LÝ ĐƯỢC: {e}")
+        print(f"  Chi tiết đã được ghi vào '{LOG_FILE}'")
     finally:
-        collector.close()
+        try:
+            collector.close()
+        except Exception as e:
+            _log_exception("collector.close()", e)
+    log.info("=== Chương trình kết thúc ===")
 
 
 if __name__ == "__main__":
