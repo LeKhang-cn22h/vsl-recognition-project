@@ -11,6 +11,8 @@ python -m pip install --upgrade pip
 
 # Install dependencies 
 pip install -r requirements.txt
+# install cuda run gpu
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
 có thể thêm dataset bằng python src/collect_data.py
 huấn luận bằng python src/train_simple.py
