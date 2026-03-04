@@ -7,7 +7,7 @@ Chạy:
     python -m src.lstm.train_bilstm
 
 Output:
-    checkpoints/bilstm_best_<timestamp>.pt  ← model tốt nhất (tên mới mỗi lần train)
+    checkpoints/bilstm_best.pt  ← model tốt nhất (tên mới mỗi lần train)
     logs/bilstm_history_<ts>.json           ← lịch sử loss/acc
     charts/bilstm_*                         ← biểu đồ training + confusion matrix + attention
 """
@@ -26,6 +26,8 @@ from sklearn.metrics import classification_report
 from torch.utils.data import Dataset, DataLoader
 
 from vsl.config import cfg as vsl_cfg
+from vsl.config_lite import cfg as vsl_cfg
+
 from visualize_bilstm import BiLSTMVisualizer
 from visualize_bilstm import BiLSTMVisualizer
 
@@ -36,7 +38,7 @@ from visualize_bilstm import BiLSTMVisualizer
 
 class Config:
     # ── Data ──
-    DATA_DIR       = 'data/processed'
+    DATA_DIR       = 'data/processed_lite'
     LABEL_MAP_PATH = 'data/processed/label_map.json'
     SEQ_LEN        = vsl_cfg.SEQ_LEN        # 64
     FEAT_DIM       = vsl_cfg.FEAT_DIM       # 346
@@ -323,8 +325,6 @@ class BiLSTMTrainer:
         self.best_val_acc = 0.0
         self.patience_cnt = 0
 
-        # Timestamp cho tên file
-        self.ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
 
         # Visualizer — tất cả chart lưu với prefix bilstm_
         self.viz = BiLSTMVisualizer(label_map, output_dir=cfg.CHART_DIR)
@@ -420,7 +420,7 @@ class BiLSTMTrainer:
                 self.patience_cnt = 0
                 ckpt_path = os.path.join(
                     self.cfg.CHECKPOINT_DIR,
-                    f'bilstm_best_{self.ts}.pt')
+                    f'bilstm_best.pt')
                 torch.save({
                     'epoch':       epoch,
                     'model_state': self.model.state_dict(),
@@ -446,7 +446,7 @@ class BiLSTMTrainer:
                 break
 
         # Save history JSON
-        log_path = os.path.join(self.cfg.LOG_DIR, f'bilstm_history_{self.ts}.json')
+        log_path = os.path.join(self.cfg.LOG_DIR, f'bilstm_history.json')
         with open(log_path, 'w', encoding='utf-8') as f:
             json.dump(self.history, f, indent=2, ensure_ascii=False)
         print(f"  Log saved → {log_path}")
@@ -471,7 +471,7 @@ class BiLSTMTrainer:
         report = _clsrpt(all_labels, all_preds, target_names=class_names, digits=4)
         print("\n" + "="*60 + "\nCLASSIFICATION REPORT\n" + "="*60)
         print(report)
-        rpt_path = os.path.join(self.cfg.LOG_DIR, f'bilstm_report_{self.ts}.txt')
+        rpt_path = os.path.join(self.cfg.LOG_DIR, f'bilstm_report.txt')
         with open(rpt_path, 'w', encoding='utf-8') as rf:
             rf.write(report)
         print(f"  Report -> {rpt_path}")
@@ -549,7 +549,7 @@ def main():
 
     print(f"\n  HOAN THANH!")
     print(f"  Charts  : {cfg.CHART_DIR}/bilstm_*/")
-    print(f"  Ckpt    : {cfg.CHECKPOINT_DIR}/bilstm_best_<timestamp>.pt\n")
+    print(f"  Ckpt    : {cfg.CHECKPOINT_DIR}/bilstm_best.pt\n")
 
 
 if __name__ == '__main__':
