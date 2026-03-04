@@ -15,6 +15,12 @@ Thay đổi v2:
     - Bỏ qua frame khi thiếu bộ phận trong lúc recording (không ghi frame đó)
     - Dừng ngay lập tức khi thiếu bộ phận quá MISSING_FRAMES_TO_STOP frames liên tiếp
     - Cho phép setup thời gian quay tối đa (max_duration_secs), tự dừng sau khi hết
+
+Thay đổi v3 (fixed):
+    - Sửa lỗi manual mode không cập nhật counter
+    - Sửa lỗi handedness index có thể gây crash
+    - Thêm logging cho exception trong MediaPipe
+    - Tách logic recording ra khỏi auto_mode check
 """
 
 import cv2
@@ -132,12 +138,17 @@ class WebcamVideoCollector:
                                 if result.pose_landmarks else None)
 
     def _on_hand(self, result, image, ts):
+        """FIX: Thêm kiểm tra an toàn cho handedness index"""
         left = right = None
         if result.hand_landmarks and result.handedness:
             for i, hlms in enumerate(result.hand_landmarks):
-                cat = result.handedness[i][0].category_name
-                if cat == 'Left': right = hlms
-                else:             left  = hlms
+                # FIX: Kiểm tra handedness[i] có phần tử không
+                if i < len(result.handedness) and len(result.handedness[i]) > 0:
+                    cat = result.handedness[i][0].category_name
+                    if cat == 'Left':
+                        right = hlms  # Mirror flip
+                    else:
+                        left = hlms
         self._latest['hands'] = (left, right)
 
     def _on_face(self, result, image, ts):
@@ -319,10 +330,10 @@ class WebcamVideoCollector:
                       num_color, -1)
 
     def _draw_recording(self, frame, w, h, elapsed, frame_count, relaxed_cnt,
-                         max_duration=0, missing_cnt=0, skipped=0):
+                         max_duration=0, missing_cnt=0, skipped=0, is_manual=False):
         """ thêm thanh thời gian + cảnh báo missing + số frame bỏ qua."""
         # Timer
-        if max_duration > 0:
+        if max_duration > 0 and not is_manual:
             remaining  = max(0.0, max_duration - elapsed)
             timer_txt  = f"REC {elapsed:.1f}s / {max_duration}s  |  {frame_count}f"
             timer_color = (0, 0, 255) if remaining > 3 else (0, 80, 255)
@@ -330,15 +341,20 @@ class WebcamVideoCollector:
             timer_txt  = f"REC {elapsed:.1f}s | {frame_count}f"
             timer_color = (0, 0, 255)
 
+        # FIX: Thêm indicator cho manual mode
+        if is_manual:
+            timer_txt = "[MANUAL] " + timer_txt
+            timer_color = (255, 100, 0)  # Orange for manual
+
         cv2.putText(frame, timer_txt,
-                    (w//2-120, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, timer_color, 2)
+                    (w//2-140, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, timer_color, 2)
 
         # Nhấp nháy chấm đỏ
         if int(elapsed*2) % 2 == 0:
-            cv2.circle(frame, (w//2-145, 20), 8, (0,0,255), -1)
+            cv2.circle(frame, (w//2-165, 20), 8, (0,0,255), -1)
 
-        # Thanh tiến trình thời gian
-        if max_duration > 0:
+        # Thanh tiến trình thời gian (chỉ hiển thị khi không phải manual và có max_duration)
+        if max_duration > 0 and not is_manual:
             bar_w = int(w * 0.5)
             bar_x = (w - bar_w) // 2
             bar_y = 35
@@ -364,8 +380,8 @@ class WebcamVideoCollector:
             cv2.putText(frame, f"Bo qua: {skipped}f",
                         (10, h-90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120,120,255), 1)
 
-        # Tay thả lỏng
-        if relaxed_cnt > 3:
+        # Tay thả lỏng (chỉ hiển thị khi auto mode)
+        if relaxed_cnt > 3 and not is_manual:
             ratio = relaxed_cnt / self.RELAXED_FRAMES_TO_STOP
             cv2.putText(frame,
                         f"Tha tay... dung sau {self.RELAXED_FRAMES_TO_STOP - relaxed_cnt}f",
@@ -464,6 +480,7 @@ class WebcamVideoCollector:
         fp              = None
         show_mesh       = True
         auto_mode       = True
+        is_manual_recording = False  # FIX: Track nếu đang recording ở manual mode
 
         dur_display = f"{max_duration}s" if max_duration > 0 else "inf"
         print(f"\n  Nhan: {label_name.upper()} | Da co: {video_count} video")
@@ -485,9 +502,18 @@ class WebcamVideoCollector:
             self._ts += 33
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
                               data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            
+            # FIX: Thêm logging cho exception
             for det in [self.pose_detector, self.hand_detector, self.face_detector]:
-                try: det.detect_async(mp_img, self._ts)
-                except Exception: pass
+                try:
+                    det.detect_async(mp_img, self._ts)
+                except Exception as e:
+                    # Log lỗi thay vì nuốt hoàn toàn
+                    if hasattr(self, '_last_error_log') and self._last_error_log == str(e):
+                        pass  # Không log lỗi lặp lại liên tục
+                    else:
+                        print(f"  [WARN] MediaPipe error: {e}")
+                        self._last_error_log = str(e)
 
             pose_lms         = self._latest['pose']
             face_lms         = self._latest['face']
@@ -520,7 +546,7 @@ class WebcamVideoCollector:
             relaxed = self._hands_relaxed(pose_lms, left_h, right_h)
 
             # ══════════════════════════════════════════════
-            # STATE MACHINE
+            # STATE MACHINE - AUTO MODE
             # ══════════════════════════════════════════════
 
             if auto_mode:
@@ -540,33 +566,42 @@ class WebcamVideoCollector:
                                                   video_count, fps, width, height, now)
                         skipped_frames = 0
                         missing_cnt    = 0
+                        is_manual_recording = False
                         print(f"  Auto: BAT DAU video {video_count+1}")
                     elif not framing['ok'] or relaxed:
                         state = 'idle'
                         print("  Auto: Huy dem nguoc")
 
-                elif state == 'recording':
-                    elapsed = now - start_time
+            # ══════════════════════════════════════════════
+            # RECORDING LOGIC - ÁP DỤNG CHO CẢ AUTO VÀ MANUAL
+            # FIX: Tách ra khỏi if auto_mode
+            # ══════════════════════════════════════════════
 
-                    if not parts_ok:
-                        # ── Thiếu bộ phận: bỏ qua frame ngay, đếm liên tiếp ──
-                        missing_cnt    += 1
-                        skipped_frames += 1
-                        # Dừng ngay nếu vượt ngưỡng
-                        if missing_cnt >= missing_limit:
-                            print(f"  DUNG NGAY: thieu {missing_name} ({missing_cnt}f lien tiep)")
-                            video_count, last_stop_time = self._stop_recording(
-                                video_writer, video_count, frame_count,
-                                elapsed, fp, label_name, now)
-                            video_writer = None
-                            state        = 'idle'
-                            missing_cnt  = 0
-                            relaxed_cnt  = 0
-                        # KHÔNG ghi frame này — continue xử lý UI rồi mới ghi
-                    else:
-                        # Bộ phận đầy đủ → reset missing
-                        missing_cnt = 0
+            if state == 'recording':
+                elapsed = now - start_time
 
+                if not parts_ok:
+                    # ── Thiếu bộ phận: bỏ qua frame ngay, đếm liên tiếp ──
+                    missing_cnt    += 1
+                    skipped_frames += 1
+                    
+                    # Dừng ngay nếu vượt ngưỡng (áp dụng cho cả auto và manual)
+                    if missing_cnt >= missing_limit:
+                        print(f"  DUNG NGAY: thieu {missing_name} ({missing_cnt}f lien tiep)")
+                        video_count, last_stop_time = self._stop_recording(
+                            video_writer, video_count, frame_count,
+                            elapsed, fp, label_name, now)
+                        video_writer = None
+                        state        = 'idle'
+                        missing_cnt  = 0
+                        relaxed_cnt  = 0
+                        is_manual_recording = False
+                else:
+                    # Bộ phận đầy đủ → reset missing
+                    missing_cnt = 0
+
+                    # Auto-stop logic CHỈ áp dụng cho auto mode
+                    if auto_mode and not is_manual_recording:
                         # Tay thả lỏng
                         relaxed_cnt = relaxed_cnt + 1 if relaxed else 0
                         if relaxed_cnt >= self.RELAXED_FRAMES_TO_STOP:
@@ -623,7 +658,8 @@ class WebcamVideoCollector:
                 self._draw_recording(
                     frame, w, h,
                     now - start_time, frame_count, relaxed_cnt,
-                    max_duration, missing_cnt, skipped_frames)
+                    max_duration, missing_cnt, skipped_frames,
+                    is_manual=is_manual_recording)  # FIX: Pass manual flag
 
             elif state == 'idle':
                 in_cooldown = (now - last_stop_time) < self.COOLDOWN_SECS
@@ -665,6 +701,7 @@ class WebcamVideoCollector:
                     skipped_frames = 0
                     missing_cnt    = 0
                     relaxed_cnt    = 0
+                    is_manual_recording = True  # FIX: Mark as manual recording
                     print(f"  Thu cong: BAT DAU video {video_count+1}")
                 else:
                     video_count, last_stop_time = self._stop_recording(
@@ -675,6 +712,7 @@ class WebcamVideoCollector:
                     relaxed_cnt    = 0
                     missing_cnt    = 0
                     skipped_frames = 0
+                    is_manual_recording = False
 
             elif key in (ord('a'), ord('A')):
                 auto_mode = not auto_mode
