@@ -9,7 +9,8 @@ Menu:
     2. Tạo nhãn mới và thu video
     3. Tiếp tục thu video cho nhãn có sẵn
     4. Thu video IDLE (nghỉ / không ký hiệu)
-    5. Lưu và thoát
+    5. Upload video có sẵn lên HuggingFace
+    6. Lưu và thoát
 
 Thay đổi v2:
     - Bỏ qua frame khi thiếu bộ phận trong lúc recording (không ghi frame đó)
@@ -21,6 +22,12 @@ Thay đổi v3 (fixed):
     - Sửa lỗi handedness index có thể gây crash
     - Thêm logging cho exception trong MediaPipe
     - Tách logic recording ra khỏi auto_mode check
+
+Thay đổi v4 (emotion + upload):
+    - Thêm tính năng nhập emotion khi tạo nhãn mới hoặc tiếp tục nhãn cũ
+    - Emotion được lưu vào file .json cùng với video (tương thích video_to_npy.py)
+    - Upload file MP4 được cải tiến: chọn từng file hoặc nhóm, lọc theo nhãn,
+      xem preview danh sách trước khi upload
 """
 
 import cv2
@@ -42,6 +49,29 @@ from collector import (
     InteractionVisualizer,
 )
 
+# Import flush_hf — tương thích với hf_uploader.py (queue-based)
+# Nếu upload_to_hf chỉ queue chứ không gửi ngay, cần gọi flush sau.
+_flush_hf = None
+for _mod in ('collector.hf_upload', 'collector.hf_uploader', 'hf_uploader'):
+    try:
+        import importlib as _il
+        _m = _il.import_module(_mod)
+        if hasattr(_m, 'flush_hf'):
+            _flush_hf = _m.flush_hf
+            break
+    except ImportError:
+        pass
+
+def _do_flush(commit_msg: str = None):
+    """Gọi flush để thực sự commit queue lên HuggingFace (nếu dùng queue-based uploader)."""
+    if _flush_hf is not None:
+        try:
+            n = _flush_hf(commit_msg)
+            if n and n > 0:
+                print(f"  [HF] Commit thanh cong: {n} file!")
+        except Exception as e:
+            print(f"  [HF] Flush error: {e}")
+
 # ── Download MediaPipe models ──────────────────────────────
 
 MODEL_URLS = {
@@ -62,6 +92,89 @@ def download_model(filename):
     print(f"  Dang tai {filename} ...")
     urllib.request.urlretrieve(MODEL_URLS[filename], filename)
     return filename
+
+
+# ── Emotion constants (đồng bộ với video_to_npy.py) ──────
+
+EMOTIONS = {
+    "angry":    0,
+    "disgust":  1,
+    "fear":     2,
+    "happy":    3,
+    "sad":      4,
+    "surprise": 5,
+    "neutral":  6,
+}
+EMOTIONS_LIST = list(EMOTIONS.keys())
+
+
+# ── Emotion helpers ───────────────────────────────────────
+
+def ask_emotion(default: str = None) -> str:
+    """
+    Hiển thị menu chọn emotion.
+    Trả về tên emotion (str) hoặc None nếu bỏ qua.
+    """
+    print("\n  ┌─ CHON EMOTION CHO NHAN NAY ─────────────────────────────┐")
+    for i, name in enumerate(EMOTIONS_LIST, 1):
+        marker = " ◀ mac dinh" if name == default else ""
+        print(f"  │  {i}. {name}{marker}")
+    print("  │  0. Bo qua (khong gan emotion)")
+    print("  └──────────────────────────────────────────────────────────┘")
+
+    prompt = f"  Chon (1-{len(EMOTIONS_LIST)}"
+    if default:
+        prompt += f", Enter='{default}'"
+    prompt += ", 0=bo qua): "
+
+    while True:
+        raw = input(prompt).strip().lower()
+        if raw == "" and default:
+            print(f"  → Dung mac dinh: {default}")
+            return default
+        if raw == "0":
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(EMOTIONS_LIST):
+            chosen = EMOTIONS_LIST[int(raw) - 1]
+            print(f"  → Emotion: {chosen}")
+            return chosen
+        # Cho phép nhập tên trực tiếp
+        if raw in EMOTIONS:
+            print(f"  → Emotion: {raw}")
+            return raw
+        print(f"  Khong hop le! Nhap so tu 1-{len(EMOTIONS_LIST)} hoac ten emotion.")
+
+
+def save_video_emotion(video_path: str, emotion: str):
+    """Lưu emotion vào file .json cạnh video (tương thích video_to_npy.py)."""
+    if not emotion:
+        return
+    meta_path = os.path.splitext(video_path)[0] + ".json"
+    data = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data['emotion']         = emotion
+    data['emotion_id']      = EMOTIONS.get(emotion, 0)
+    data['emotion_updated'] = datetime.now().isoformat()
+    with open(meta_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def get_video_emotion(video_path: str):
+    """Đọc emotion từ file .json cạnh video."""
+    meta_path = os.path.splitext(video_path)[0] + ".json"
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get('emotion')
+        except Exception:
+            pass
+    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -142,7 +255,6 @@ class WebcamVideoCollector:
         left = right = None
         if result.hand_landmarks and result.handedness:
             for i, hlms in enumerate(result.hand_landmarks):
-                # FIX: Kiểm tra handedness[i] có phần tử không
                 if i < len(result.handedness) and len(result.handedness[i]) > 0:
                     cat = result.handedness[i][0].category_name
                     if cat == 'Left':
@@ -196,11 +308,12 @@ class WebcamVideoCollector:
             print("\n  Chua co video nao")
         else:
             total = 0
-            print(f"\n  {'Nhan':<30} {'So video':<15} {'Duong dan'}")
+            print(f"\n  {'Nhan':<30} {'So video':<15} {'Emotion mac dinh'}")
             print("  " + "-"*65)
             for lb, info in sorted(self.metadata['labels'].items()):
-                n = info.get('num_videos', 0)
-                print(f"  {lb:<30} {n:<15} {info.get('path','')}")
+                n   = info.get('num_videos', 0)
+                emo = info.get('default_emotion', '-')
+                print(f"  {lb:<30} {n:<15} {emo}")
                 total += n
             print("  " + "-"*65)
             print(f"  {'TONG CONG':<30} {total}")
@@ -237,11 +350,6 @@ class WebcamVideoCollector:
 
     @staticmethod
     def _parts_present(pose_lms, left_h, right_h) -> tuple:
-        """
-        Kiểm tra bộ phận tối thiểu cần thiết để ghi frame.
-        Yêu cầu: pose + ít nhất 1 tay.
-        Trả về (ok: bool, missing_name: str)
-        """
         if pose_lms is None:
             return False, "Pose"
         if left_h is None and right_h is None:
@@ -330,9 +438,9 @@ class WebcamVideoCollector:
                       num_color, -1)
 
     def _draw_recording(self, frame, w, h, elapsed, frame_count, relaxed_cnt,
-                         max_duration=0, missing_cnt=0, skipped=0, is_manual=False):
-        """ thêm thanh thời gian + cảnh báo missing + số frame bỏ qua."""
-        # Timer
+                         max_duration=0, missing_cnt=0, skipped=0, is_manual=False,
+                         emotion=None):
+        """Thêm hiển thị emotion đang ghi."""
         if max_duration > 0 and not is_manual:
             remaining  = max(0.0, max_duration - elapsed)
             timer_txt  = f"REC {elapsed:.1f}s / {max_duration}s  |  {frame_count}f"
@@ -341,10 +449,9 @@ class WebcamVideoCollector:
             timer_txt  = f"REC {elapsed:.1f}s | {frame_count}f"
             timer_color = (0, 0, 255)
 
-        # FIX: Thêm indicator cho manual mode
         if is_manual:
             timer_txt = "[MANUAL] " + timer_txt
-            timer_color = (255, 100, 0)  # Orange for manual
+            timer_color = (255, 100, 0)
 
         cv2.putText(frame, timer_txt,
                     (w//2-140, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, timer_color, 2)
@@ -353,7 +460,20 @@ class WebcamVideoCollector:
         if int(elapsed*2) % 2 == 0:
             cv2.circle(frame, (w//2-165, 20), 8, (0,0,255), -1)
 
-        # Thanh tiến trình thời gian (chỉ hiển thị khi không phải manual và có max_duration)
+        # Hiển thị emotion đang ghi
+        if emotion:
+            emo_color = {
+                'happy': (0, 220, 120),
+                'angry': (0, 60, 255),
+                'sad':   (200, 100, 50),
+                'neutral': (180, 180, 180),
+                'surprise': (0, 200, 255),
+                'fear': (80, 0, 200),
+                'disgust': (50, 180, 80),
+            }.get(emotion, (200, 200, 200))
+            cv2.putText(frame, f"EMO: {emotion.upper()}",
+                        (w - 200, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, emo_color, 2)
+
         if max_duration > 0 and not is_manual:
             bar_w = int(w * 0.5)
             bar_x = (w - bar_w) // 2
@@ -363,7 +483,6 @@ class WebcamVideoCollector:
             cv2.rectangle(frame, (bar_x, bar_y), (bar_x+bar_w, bar_y+6), (50,50,50), -1)
             cv2.rectangle(frame, (bar_x, bar_y), (bar_x+int(bar_w*ratio), bar_y+6), col, -1)
 
-        # Cảnh báo thiếu bộ phận
         if missing_cnt > 0:
             ratio_m  = missing_cnt / self.MISSING_FRAMES_TO_STOP
             warn_txt = f"! THIEU BO PHAN ({missing_cnt}/{self.MISSING_FRAMES_TO_STOP}f)"
@@ -375,12 +494,10 @@ class WebcamVideoCollector:
             cv2.rectangle(frame, (bx2, h//2), (bx2+int(bw2*ratio_m), h//2+10),
                           (0, 50, 255), -1)
 
-        # Số frame bị bỏ qua
         if skipped > 0:
             cv2.putText(frame, f"Bo qua: {skipped}f",
                         (10, h-90), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120,120,255), 1)
 
-        # Tay thả lỏng (chỉ hiển thị khi auto mode)
         if relaxed_cnt > 3 and not is_manual:
             ratio = relaxed_cnt / self.RELAXED_FRAMES_TO_STOP
             cv2.putText(frame,
@@ -397,10 +514,6 @@ class WebcamVideoCollector:
     # ══════════════════════════════════════════════════════
 
     def _ask_rec_config(self) -> dict:
-        """
-        Hỏi người dùng muốn cấu hình gì.
-        Trả về dict với max_duration và missing_limit.
-        """
         print("\n" + "-"*50)
         print(f"  Cau hinh mac dinh:")
         dur_txt = f"{self.DEFAULT_MAX_DURATION}s" if self.DEFAULT_MAX_DURATION > 0 else "khong gioi han"
@@ -413,7 +526,6 @@ class WebcamVideoCollector:
                 'missing_limit': self.MISSING_FRAMES_TO_STOP,
             }
 
-        # max_duration
         try:
             val = input(f"  Thoi gian toi da (giay, 0=khong gioi han) [{self.DEFAULT_MAX_DURATION}]: ").strip()
             max_dur = int(val) if val else self.DEFAULT_MAX_DURATION
@@ -421,7 +533,6 @@ class WebcamVideoCollector:
         except ValueError:
             max_dur = self.DEFAULT_MAX_DURATION
 
-        # missing_limit
         try:
             val = input(f"  So frames thieu bo phan → dung ngay [{self.MISSING_FRAMES_TO_STOP}]: ").strip()
             miss = int(val) if val else self.MISSING_FRAMES_TO_STOP
@@ -437,12 +548,14 @@ class WebcamVideoCollector:
     # THU THẬP VIDEO
     # ══════════════════════════════════════════════════════
 
-    def collect_label(self, label_name: str, rec_config: dict = None):
+    def collect_label(self, label_name: str, rec_config: dict = None,
+                      default_emotion: str = None):
         """
         rec_config = {
             'max_duration' : int  — giây tối đa, 0 = không giới hạn
             'missing_limit': int  — frames thiếu bộ phận liên tiếp → dừng ngay
         }
+        default_emotion : str hoặc None — emotion mặc định cho tất cả video của nhãn này
         """
         if rec_config is None:
             rec_config = {
@@ -468,24 +581,27 @@ class WebcamVideoCollector:
         video_count = len([f for f in os.listdir(label_dir)
                            if f.endswith('.mp4')])
 
-        state           = 'idle'
-        video_writer    = None
-        frame_count     = 0
-        skipped_frames  = 0   # ← số frame bị bỏ qua (thiếu bộ phận)
-        missing_cnt     = 0   # ← frames liên tiếp thiếu bộ phận
-        start_time      = 0
-        countdown_start = 0
-        relaxed_cnt     = 0
-        last_stop_time  = 0
-        fp              = None
-        show_mesh       = True
-        auto_mode       = True
-        is_manual_recording = False  # FIX: Track nếu đang recording ở manual mode
+        state               = 'idle'
+        video_writer        = None
+        frame_count         = 0
+        skipped_frames      = 0
+        missing_cnt         = 0
+        start_time          = 0
+        countdown_start     = 0
+        relaxed_cnt         = 0
+        last_stop_time      = 0
+        fp                  = None
+        show_mesh           = True
+        auto_mode           = True
+        is_manual_recording = False
+        current_emotion     = default_emotion  # emotion cho video đang ghi
 
+        emo_display = default_emotion if default_emotion else "chua chon"
         dur_display = f"{max_duration}s" if max_duration > 0 else "inf"
         print(f"\n  Nhan: {label_name.upper()} | Da co: {video_count} video")
+        print(f"  Emotion mac dinh: {emo_display}")
         print(f"  Max: {dur_display} | Missing: {missing_limit}f → dung ngay")
-        print("  [SPACE] Thu cong  [A] Auto  [M] Mesh  [Q] Thoat\n")
+        print("  [SPACE] Thu cong  [A] Auto  [M] Mesh  [E] Doi emotion  [Q] Thoat\n")
 
         self._ts = 0
 
@@ -498,19 +614,16 @@ class WebcamVideoCollector:
             h, w        = frame.shape[:2]
             now         = time.time()
 
-            # ── Gửi đến MediaPipe ──
             self._ts += 33
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
                               data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            
-            # FIX: Thêm logging cho exception
+
             for det in [self.pose_detector, self.hand_detector, self.face_detector]:
                 try:
                     det.detect_async(mp_img, self._ts)
                 except Exception as e:
-                    # Log lỗi thay vì nuốt hoàn toàn
                     if hasattr(self, '_last_error_log') and self._last_error_log == str(e):
-                        pass  # Không log lỗi lặp lại liên tục
+                        pass
                     else:
                         print(f"  [WARN] MediaPipe error: {e}")
                         self._last_error_log = str(e)
@@ -520,10 +633,8 @@ class WebcamVideoCollector:
             blends           = self._latest['blendshapes']
             left_h, right_h  = self._latest['hands'] or (None, None)
 
-            # ── Kiểm tra bộ phận (dùng trong recording) ──
             parts_ok, missing_name = self._parts_present(pose_lms, left_h, right_h)
 
-            # ── Vẽ keypoints ──
             FullBodyDrawer.draw_pose(frame, pose_lms, w, h)
             if show_mesh:
                 FullBodyDrawer.draw_face_mesh(frame, face_lms, w, h)
@@ -545,9 +656,7 @@ class WebcamVideoCollector:
 
             relaxed = self._hands_relaxed(pose_lms, left_h, right_h)
 
-            # ══════════════════════════════════════════════
-            # STATE MACHINE - AUTO MODE
-            # ══════════════════════════════════════════════
+            # ── Auto Mode State Machine ──────────────────
 
             if auto_mode:
                 if state == 'idle':
@@ -564,80 +673,72 @@ class WebcamVideoCollector:
                         state, fp, video_writer, frame_count, start_time = \
                             self._start_recording(label_name, label_dir,
                                                   video_count, fps, width, height, now)
-                        skipped_frames = 0
-                        missing_cnt    = 0
+                        skipped_frames      = 0
+                        missing_cnt         = 0
                         is_manual_recording = False
-                        print(f"  Auto: BAT DAU video {video_count+1}")
+                        current_emotion     = default_emotion
+                        print(f"  Auto: BAT DAU video {video_count+1}  [emotion={current_emotion or 'none'}]")
                     elif not framing['ok'] or relaxed:
                         state = 'idle'
                         print("  Auto: Huy dem nguoc")
 
-            # ══════════════════════════════════════════════
-            # RECORDING LOGIC - ÁP DỤNG CHO CẢ AUTO VÀ MANUAL
-            # FIX: Tách ra khỏi if auto_mode
-            # ══════════════════════════════════════════════
+            # ── Recording Logic ──────────────────────────
 
             if state == 'recording':
                 elapsed = now - start_time
 
                 if not parts_ok:
-                    # ── Thiếu bộ phận: bỏ qua frame ngay, đếm liên tiếp ──
                     missing_cnt    += 1
                     skipped_frames += 1
-                    
-                    # Dừng ngay nếu vượt ngưỡng (áp dụng cho cả auto và manual)
                     if missing_cnt >= missing_limit:
                         print(f"  DUNG NGAY: thieu {missing_name} ({missing_cnt}f lien tiep)")
                         video_count, last_stop_time = self._stop_recording(
                             video_writer, video_count, frame_count,
-                            elapsed, fp, label_name, now)
-                        video_writer = None
-                        state        = 'idle'
-                        missing_cnt  = 0
-                        relaxed_cnt  = 0
+                            elapsed, fp, label_name, now, current_emotion)
+                        video_writer        = None
+                        state               = 'idle'
+                        missing_cnt         = 0
+                        relaxed_cnt         = 0
                         is_manual_recording = False
                 else:
-                    # Bộ phận đầy đủ → reset missing
                     missing_cnt = 0
 
-                    # Auto-stop logic CHỈ áp dụng cho auto mode
                     if auto_mode and not is_manual_recording:
-                        # Tay thả lỏng
                         relaxed_cnt = relaxed_cnt + 1 if relaxed else 0
                         if relaxed_cnt >= self.RELAXED_FRAMES_TO_STOP:
                             video_count, last_stop_time = self._stop_recording(
                                 video_writer, video_count, frame_count,
-                                elapsed, fp, label_name, now)
-                            video_writer = None
-                            state        = 'idle'
-                            relaxed_cnt  = 0
-                            missing_cnt  = 0
-
-                        # Hết thời gian tối đa
+                                elapsed, fp, label_name, now, current_emotion)
+                            video_writer        = None
+                            state               = 'idle'
+                            relaxed_cnt         = 0
+                            missing_cnt         = 0
                         elif max_duration > 0 and elapsed >= max_duration:
                             print(f"  AUTO DUNG: het {max_duration}s")
                             video_count, last_stop_time = self._stop_recording(
                                 video_writer, video_count, frame_count,
-                                elapsed, fp, label_name, now)
-                            video_writer = None
-                            state        = 'idle'
-                            relaxed_cnt  = 0
-                            missing_cnt  = 0
+                                elapsed, fp, label_name, now, current_emotion)
+                            video_writer        = None
+                            state               = 'idle'
+                            relaxed_cnt         = 0
+                            missing_cnt         = 0
 
-            # ── Ghi frame: CHỈ khi recording + bộ phận đầy đủ ──
             if state == 'recording' and video_writer and parts_ok:
                 video_writer.write(clean_frame)
                 frame_count += 1
 
-            # ══════════════════════════════════════════════
-            # HEADER + STATE DISPLAY
-            # ══════════════════════════════════════════════
+            # ── Header ──────────────────────────────────
 
             cv2.rectangle(frame, (0,0), (w,55), (30,30,30), -1)
             cv2.putText(frame, f"Nhan: {label_name.upper()}", (10,25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
             cv2.putText(frame, f"Video: {video_count}", (10,48),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+
+            # Hiển thị emotion mặc định ở header
+            emo_hdr = default_emotion if default_emotion else "none"
+            cv2.putText(frame, f"Emo:{emo_hdr}",
+                        (w-330, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150,220,255), 1)
 
             dur_hdr = f"{max_duration}s" if max_duration > 0 else "inf"
             cv2.putText(frame, f"Max:{dur_hdr} Miss:{missing_limit}f",
@@ -659,7 +760,8 @@ class WebcamVideoCollector:
                     frame, w, h,
                     now - start_time, frame_count, relaxed_cnt,
                     max_duration, missing_cnt, skipped_frames,
-                    is_manual=is_manual_recording)  # FIX: Pass manual flag
+                    is_manual=is_manual_recording,
+                    emotion=current_emotion)
 
             elif state == 'idle':
                 in_cooldown = (now - last_stop_time) < self.COOLDOWN_SECS
@@ -684,35 +786,52 @@ class WebcamVideoCollector:
 
             cv2.rectangle(frame, (0,h-30), (w,h), (30,30,30), -1)
             cv2.putText(frame,
-                        "[SPACE] Thu cong  |  [A] Auto  |  [M] Mesh  |  [Q] Thoat",
-                        (10, h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180,180,180), 1)
+                        "[SPACE] Thu cong  |  [A] Auto  |  [M] Mesh  |  [E] Emotion  |  [Q] Thoat",
+                        (10, h-8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180,180,180), 1)
 
             cv2.imshow('VSL Collector', frame)
 
-            # ── Phím bấm ──
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord(' '):
                 if state != 'recording':
+                    # Đặt emotion trước khi ghi nếu chưa có
+                    if default_emotion is None:
+                        print("\n  [!] Chua co emotion! Chon emotion cho video nay:")
+                        chosen = ask_emotion()
+                        current_emotion = chosen
+                    else:
+                        current_emotion = default_emotion
                     state = 'recording'
                     fp, video_writer, frame_count, start_time = \
                         self._start_recording_manual(
                             label_name, label_dir, video_count, fps, width, height)
-                    skipped_frames = 0
-                    missing_cnt    = 0
-                    relaxed_cnt    = 0
-                    is_manual_recording = True  # FIX: Mark as manual recording
-                    print(f"  Thu cong: BAT DAU video {video_count+1}")
+                    skipped_frames      = 0
+                    missing_cnt         = 0
+                    relaxed_cnt         = 0
+                    is_manual_recording = True
+                    print(f"  Thu cong: BAT DAU video {video_count+1}  [emotion={current_emotion or 'none'}]")
                 else:
                     video_count, last_stop_time = self._stop_recording(
                         video_writer, video_count, frame_count,
-                        time.time() - start_time, fp, label_name, time.time())
-                    video_writer   = None
-                    state          = 'idle'
-                    relaxed_cnt    = 0
-                    missing_cnt    = 0
-                    skipped_frames = 0
+                        time.time() - start_time, fp, label_name, time.time(),
+                        current_emotion)
+                    video_writer        = None
+                    state               = 'idle'
+                    relaxed_cnt         = 0
+                    missing_cnt         = 0
+                    skipped_frames      = 0
                     is_manual_recording = False
+
+            elif key in (ord('e'), ord('E')):
+                # Đổi emotion mặc định ngay trong lúc quay
+                if state != 'recording':
+                    print("\n  Doi emotion mac dinh:")
+                    new_emo = ask_emotion(default=default_emotion)
+                    default_emotion = new_emo
+                    print(f"  Emotion moi: {default_emotion or 'none'}")
+                else:
+                    print("  [!] Khong the doi emotion khi dang ghi!")
 
             elif key in (ord('a'), ord('A')):
                 auto_mode = not auto_mode
@@ -726,6 +845,9 @@ class WebcamVideoCollector:
             elif key in (ord('q'), ord('Q')):
                 if state == 'recording' and video_writer:
                     video_writer.release()
+                    # Lưu emotion cho video vừa ghi dở
+                    if current_emotion and fp:
+                        save_video_emotion(fp, current_emotion)
                     video_count += 1
                 break
 
@@ -734,11 +856,13 @@ class WebcamVideoCollector:
         self._ts = 0
 
         self.metadata['labels'][label_name] = dict(
-            num_videos=video_count, path=label_dir)
+            num_videos=video_count,
+            path=label_dir,
+            default_emotion=default_emotion or '')
         self.metadata['total_videos'] = sum(
             v['num_videos'] for v in self.metadata['labels'].values())
         self._save_meta()
-        print(f"\n  Hoan thanh: {label_name} - {video_count} video")
+        print(f"\n  Hoan thanh: {label_name} - {video_count} video  [emotion={default_emotion or 'none'}]")
 
     # ── Start / Stop helpers ──────────────────────────────
 
@@ -761,11 +885,18 @@ class WebcamVideoCollector:
         return fp, vw, 0, time.time()
 
     def _stop_recording(self, video_writer, video_count,
-                         frame_count, duration, fp, label_name, now):
+                         frame_count, duration, fp, label_name, now,
+                         emotion=None):
+        """Dừng ghi, lưu emotion vào .json cạnh video, rồi flush lên HF."""
         video_writer.release()
         video_count += 1
-        print(f"  DUNG video {video_count} ({frame_count}f, {duration:.1f}s)")
+        print(f"  DUNG video {video_count} ({frame_count}f, {duration:.1f}s)  [emotion={emotion or 'none'}]")
+        # Lưu emotion
+        if emotion and fp:
+            save_video_emotion(fp, emotion)
+        # Queue lên HF rồi flush ngay (commit 1 file 1 lần)
         upload_to_hf(fp, label_name, split="train")
+        _do_flush(f"Add {label_name}/{os.path.basename(fp)}")
         return video_count, now
 
     # ══════════════════════════════════════════════════════
@@ -782,10 +913,11 @@ class WebcamVideoCollector:
             print("  3. Tiep tuc thu video cho nhan co san")
             print("  4. Thu video IDLE (nghi / khong ky hieu)")
             print("  5. Upload video co san len HuggingFace")
-            print("  6. Luu va thoat")
+            print("  6. Gan emotion cho video co san")
+            print("  7. Luu va thoat")
             print("="*60)
 
-            ch = input("\n  Chon (1-6): ").strip()
+            ch = input("\n  Chon (1-7): ").strip()
 
             if ch == "1":
                 self.show_statistics()
@@ -799,8 +931,13 @@ class WebcamVideoCollector:
                 if lb in self.metadata['labels']:
                     if input(f"  '{lb}' da ton tai! Thu them? (y/n): ").strip().lower() != 'y':
                         continue
+
+                # ── Chọn emotion mặc định cho nhãn này ──
+                print(f"\n  Chon emotion mac dinh cho tat ca video cua nhan '{lb}':")
+                default_emo = ask_emotion(default='neutral')
+
                 rec_cfg = self._ask_rec_config()
-                self.collect_label(lb, rec_config=rec_cfg)
+                self.collect_label(lb, rec_config=rec_cfg, default_emotion=default_emo)
 
             elif ch == "3":
                 labels = list(self.metadata['labels'].keys())
@@ -808,13 +945,26 @@ class WebcamVideoCollector:
                     print("  Chua co nhan nao!"); continue
                 print("\n  Danh sach nhan:")
                 for i, lb in enumerate(labels, 1):
-                    n = self.metadata['labels'][lb]['num_videos']
-                    print(f"  {i:>3}. {lb} ({n} video)")
+                    info = self.metadata['labels'][lb]
+                    n    = info.get('num_videos', 0)
+                    emo  = info.get('default_emotion', '-')
+                    print(f"  {i:>3}. {lb} ({n} video)  [emo: {emo}]")
                 try:
                     idx = int(input("\n  Chon so: ").strip()) - 1
                     if 0 <= idx < len(labels):
+                        chosen_lb  = labels[idx]
+                        saved_emo  = self.metadata['labels'][chosen_lb].get('default_emotion') or None
+
+                        # Hỏi có muốn đổi emotion không
+                        print(f"\n  Emotion hien tai cua '{chosen_lb}': {saved_emo or 'chua co'}")
+                        ans = input("  Doi emotion? (y/n, mac dinh n): ").strip().lower()
+                        if ans == 'y':
+                            new_emo = ask_emotion(default=saved_emo or 'neutral')
+                        else:
+                            new_emo = saved_emo
+
                         rec_cfg = self._ask_rec_config()
-                        self.collect_label(labels[idx], rec_config=rec_cfg)
+                        self.collect_label(chosen_lb, rec_config=rec_cfg, default_emotion=new_emo)
                     else:
                         print("  Khong hop le!")
                 except ValueError:
@@ -827,6 +977,9 @@ class WebcamVideoCollector:
                 self._menu_upload_files()
 
             elif ch == "6":
+                self._menu_assign_existing_emotions()
+
+            elif ch == "7":
                 self._save_meta()
                 self.show_statistics()
                 self._ask_organize_on_exit()
@@ -834,6 +987,128 @@ class WebcamVideoCollector:
                 break
             else:
                 print("  Khong hop le!")
+
+    # ══════════════════════════════════════════════════════
+    # MENU: GÁN EMOTION CHO VIDEO CÓ SẴN
+    # ══════════════════════════════════════════════════════
+
+    def _menu_assign_existing_emotions(self):
+        """
+        Quét tất cả video trong output_dir, tìm video chưa có emotion,
+        cho phép người dùng gán thủ công hoặc hàng loạt.
+        """
+        print("\n" + "="*60)
+        print(" GAN EMOTION CHO VIDEO CO SAN ".center(60))
+        print("="*60)
+
+        # Thu thập danh sách video theo label
+        label_videos = {}
+        for lb_name in sorted(os.listdir(self.output_dir)):
+            lb_path = os.path.join(self.output_dir, lb_name)
+            if not os.path.isdir(lb_path) or lb_name in ('train','val','test'):
+                continue
+            videos = sorted([f for f in os.listdir(lb_path) if f.endswith('.mp4')])
+            if not videos:
+                continue
+            missing = []
+            assigned = []
+            for vf in videos:
+                vp = os.path.join(lb_path, vf)
+                emo = get_video_emotion(vp)
+                if emo:
+                    assigned.append((vp, emo))
+                else:
+                    missing.append(vp)
+            label_videos[lb_name] = {'missing': missing, 'assigned': assigned}
+
+        if not label_videos:
+            print("\n  Khong tim thay video nao!"); return
+
+        # Hiển thị tổng quan
+        total_missing = sum(len(v['missing']) for v in label_videos.values())
+        print(f"\n  {'Nhan':<30} {'Co emotion':<15} {'Thieu emotion'}")
+        print("  " + "-"*55)
+        for lb, data in label_videos.items():
+            ok  = len(data['assigned'])
+            mis = len(data['missing'])
+            status = f"⚠️  {mis}" if mis > 0 else "✅"
+            print(f"  {lb:<30} {ok:<15} {status}")
+        print("  " + "-"*55)
+        print(f"  Tong thieu: {total_missing} video\n")
+
+        if total_missing == 0:
+            print("  Tat ca video da co emotion!"); return
+
+        print("  [1] Gan emotion cho 1 nhan")
+        print("  [2] Gan emotion cho tat ca nhan thieu")
+        print("  [3] Gan theo tung video (manual)")
+        print("  [0] Quay lai")
+        sub = input("\n  Chon: ").strip()
+
+        if sub == "0":
+            return
+
+        elif sub == "1":
+            labels_with_missing = [lb for lb, d in label_videos.items() if d['missing']]
+            print("\n  Nhan co video thieu emotion:")
+            for i, lb in enumerate(labels_with_missing, 1):
+                print(f"  {i:>3}. {lb}  ({len(label_videos[lb]['missing'])} video)")
+            try:
+                idx = int(input("\n  Chon so: ").strip()) - 1
+                if 0 <= idx < len(labels_with_missing):
+                    lb   = labels_with_missing[idx]
+                    data = label_videos[lb]
+                    print(f"\n  Gan emotion cho {len(data['missing'])} video cua '{lb}':")
+                    emo = ask_emotion(default='neutral')
+                    if emo:
+                        for vp in data['missing']:
+                            save_video_emotion(vp, emo)
+                            print(f"    ✓ {os.path.basename(vp)} → {emo}")
+                        print(f"  Xong! {len(data['missing'])} video da duoc gan '{emo}'")
+                else:
+                    print("  Khong hop le!")
+            except ValueError:
+                print("  Nhap so!")
+
+        elif sub == "2":
+            print(f"\n  Gan emotion cho {total_missing} video thieu:")
+            emo = ask_emotion(default='neutral')
+            if emo:
+                count = 0
+                for lb, data in label_videos.items():
+                    for vp in data['missing']:
+                        save_video_emotion(vp, emo)
+                        count += 1
+                print(f"  Xong! {count} video da duoc gan '{emo}'")
+
+        elif sub == "3":
+            print("\n  Gang theo tung video (s=skip, q=thoat):")
+            for lb, data in label_videos.items():
+                if not data['missing']:
+                    continue
+                print(f"\n  ── {lb} ──  ({len(data['missing'])} video thieu)")
+                for vp in data['missing']:
+                    print(f"    {os.path.basename(vp)}")
+                    raw = input("    Emotion (1-7 / ten / s=skip / q=thoat): ").strip().lower()
+                    if raw == 'q':
+                        return
+                    if raw == 's':
+                        continue
+                    if raw.isdigit() and 1 <= int(raw) <= len(EMOTIONS_LIST):
+                        emo = EMOTIONS_LIST[int(raw) - 1]
+                    elif raw in EMOTIONS:
+                        emo = raw
+                    else:
+                        print("    Khong hop le, bo qua.")
+                        continue
+                    save_video_emotion(vp, emo)
+                    print(f"    → {emo}")
+
+        input("\n  ENTER de quay lai...")
+
+    # ══════════════════════════════════════════════════════
+    # MENU: IDLE
+    # ══════════════════════════════════════════════════════
 
     def _menu_idle(self):
         idle_actions = [
@@ -865,11 +1140,15 @@ class WebcamVideoCollector:
             choice  = input("\n  Chon (0 / 1-12 / 99): ").strip()
             rec_cfg = self._ask_rec_config()
 
+            # Idle thường dùng emotion neutral
+            print("\n  Emotion cho video IDLE (thuong la neutral):")
+            idle_emo = ask_emotion(default='neutral')
+
             if choice == "0":
                 for key, desc in idle_actions:
                     label = f"__idle__{key}"
                     input(f"\n  Chuan bi: {desc}\n  Nhan ENTER de bat dau...")
-                    self.collect_label(label, rec_config=rec_cfg)
+                    self.collect_label(label, rec_config=rec_cfg, default_emotion=idle_emo)
             elif choice == "99":
                 custom = input("  Ten hanh dong (vd: nhin_dien_thoai): ").strip()
                 if not custom:
@@ -877,20 +1156,24 @@ class WebcamVideoCollector:
                 label = f"__idle__{custom}"
                 viet  = input(f"  Ten tieng Viet cho '{label}': ").strip() or label
                 self._save_display_name(label, viet)
-                self.collect_label(label, rec_config=rec_cfg)
+                self.collect_label(label, rec_config=rec_cfg, default_emotion=idle_emo)
             else:
                 idx = int(choice) - 1
                 if 0 <= idx < len(idle_actions):
                     key, desc = idle_actions[idx]
                     label = f"__idle__{key}"
                     print(f"\n  Chuan bi: {desc}")
-                    self.collect_label(label, rec_config=rec_cfg)
+                    self.collect_label(label, rec_config=rec_cfg, default_emotion=idle_emo)
                 else:
                     print("  Khong hop le!")
         except ValueError:
             print("  Nhap so!")
 
-    # ── Upload + organize (giữ nguyên từ bản gốc) ────────
+    # ══════════════════════════════════════════════════════
+    # MENU: UPLOAD FILE MP4
+    # Cải tiến: chọn file tùy ý, xem preview, lọc theo nhãn,
+    # gán emotion trước khi upload
+    # ══════════════════════════════════════════════════════
 
     def _pick_files_gui(self) -> list:
         try:
@@ -907,40 +1190,171 @@ class WebcamVideoCollector:
         except Exception:
             return []
 
+    def _pick_folder_gui(self) -> str:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk(); root.withdraw()
+            root.attributes('-topmost', True)
+            folder = filedialog.askdirectory(title="Chon thu muc chua video")
+            root.destroy()
+            return folder
+        except Exception:
+            return ""
+
+    def _scan_videos_in_path(self, path: str) -> list:
+        """Quét video từ file hoặc thư mục."""
+        exts  = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+        found = []
+        if os.path.isfile(path):
+            if os.path.splitext(path)[1].lower() in exts:
+                found.append(path)
+        elif os.path.isdir(path):
+            # Quét đệ quy 1 cấp
+            for f in sorted(os.listdir(path)):
+                fp = os.path.join(path, f)
+                if os.path.isfile(fp) and os.path.splitext(f)[1].lower() in exts:
+                    found.append(fp)
+        return found
+
+    def _preview_files(self, files: list):
+        """Hiển thị danh sách file sẽ upload."""
+        print(f"\n  {'#':<5} {'File':<50} {'Emotion'}")
+        print("  " + "-"*70)
+        for i, fp in enumerate(files, 1):
+            emo = get_video_emotion(fp) or "(chua co)"
+            fname = os.path.basename(fp)
+            # Rút gọn nếu quá dài
+            if len(fname) > 45:
+                fname = "..." + fname[-42:]
+            print(f"  {i:<5} {fname:<50} {emo}")
+        print("  " + "-"*70)
+        print(f"  Tong: {len(files)} file\n")
+
     def _menu_upload_files(self):
-        from collector.hf_upload import _hf_api, HF_REPO_ID
+        from collector.hf_upload import init_hf, HF_REPO_ID
         print("\n" + "="*60)
         print(" UPLOAD VIDEO LEN HUGGINGFACE ".center(60))
         print("="*60)
-        if _hf_api is None:
+        if init_hf is None:
             print("\n  CANH BAO: HuggingFace chua duoc ket noi!")
             input("\n  Nhan ENTER de quay lai menu..."); return
 
-        print("\n  [1] Hop thoai GUI  [2] Nhap tay")
-        ch = input("\n  Chon (1/2): ").strip()
+        print("\n  Chon nguon file:")
+        print("  [1] Hop thoai GUI — chon file")
+        print("  [2] Hop thoai GUI — chon thu muc")
+        print("  [3] Nhap duong dan thu cong")
+        print("  [4] Lay tu thu muc output hien tai (data/videos)")
+        ch = input("\n  Chon (1-4): ").strip()
+
         selected_files = []
+
         if ch == "1":
             selected_files = self._pick_files_gui()
-            if not selected_files: ch = "2"
-        if ch == "2":
-            print("\n  Nhap duong dan (dong trong de ket thuc):")
+            if not selected_files:
+                print("  Khong chon file nao.")
+
+        elif ch == "2":
+            folder = self._pick_folder_gui()
+            if folder:
+                selected_files = self._scan_videos_in_path(folder)
+                print(f"  Tim thay {len(selected_files)} file trong '{folder}'")
+            else:
+                print("  Khong chon thu muc nao.")
+
+        elif ch == "3":
+            print("\n  Nhap duong dan file hoac thu muc (dong trong de ket thuc):")
             while True:
                 p = input("  > ").strip().strip('"').strip("'")
-                if not p: break
-                if os.path.isfile(p):
-                    selected_files.append(p)
-                elif os.path.isdir(p):
-                    exts  = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
-                    found = [os.path.join(p, f) for f in sorted(os.listdir(p))
-                             if os.path.splitext(f)[1].lower() in exts]
+                if not p:
+                    break
+                found = self._scan_videos_in_path(p)
+                if found:
                     selected_files.extend(found)
+                    print(f"    → {len(found)} file them vao danh sach")
                 else:
                     print(f"    Khong tim thay: {p}")
+
+        elif ch == "4":
+            # Liệt kê các label trong output_dir
+            labels_dirs = []
+            for lb in sorted(os.listdir(self.output_dir)):
+                lp = os.path.join(self.output_dir, lb)
+                if os.path.isdir(lp) and lb not in ('train','val','test'):
+                    labels_dirs.append(lb)
+
+            if not labels_dirs:
+                print("  Khong co nhan nao trong data/videos!"); return
+
+            print("\n  Nhan co san:")
+            for i, lb in enumerate(labels_dirs, 1):
+                n = len([f for f in os.listdir(os.path.join(self.output_dir, lb))
+                         if f.endswith('.mp4')])
+                print(f"  {i:>3}. {lb} ({n} video)")
+            print("   0. Chon tat ca nhan")
+
+            raw = input("\n  Chon (0 / so / nhieu so cach nhau boi dau phay): ").strip()
+            chosen_labels = []
+            if raw == "0":
+                chosen_labels = labels_dirs
+            else:
+                for tok in raw.split(","):
+                    tok = tok.strip()
+                    try:
+                        idx = int(tok) - 1
+                        if 0 <= idx < len(labels_dirs):
+                            chosen_labels.append(labels_dirs[idx])
+                    except ValueError:
+                        if tok in labels_dirs:
+                            chosen_labels.append(tok)
+
+            for lb in chosen_labels:
+                lp = os.path.join(self.output_dir, lb)
+                selected_files.extend(self._scan_videos_in_path(lp))
+            print(f"  Tong: {len(selected_files)} file tu {len(chosen_labels)} nhan")
 
         if not selected_files:
             input("  Khong co file. ENTER de quay lai..."); return
 
-        print(f"\n  Da chon {len(selected_files)} file")
+        # ── Preview danh sách file ──
+        self._preview_files(selected_files)
+
+        # ── Kiểm tra file thiếu emotion ──
+        files_no_emo = [f for f in selected_files if not get_video_emotion(f)]
+        if files_no_emo:
+            print(f"  ⚠️  {len(files_no_emo)}/{len(selected_files)} file chua co emotion!")
+            print("  [1] Gan cung 1 emotion cho tat ca file thieu")
+            print("  [2] Bo qua (upload khong co emotion)")
+            sub = input("  Chon: ").strip()
+            if sub == "1":
+                emo = ask_emotion(default='neutral')
+                if emo:
+                    for fp in files_no_emo:
+                        save_video_emotion(fp, emo)
+                    print(f"  Da gan '{emo}' cho {len(files_no_emo)} file")
+
+        # ── Lọc / xác nhận ──
+        print(f"\n  Xac nhan upload {len(selected_files)} file?")
+        confirm = input("  (y=upload / n=huy / f=loc bot): ").strip().lower()
+        if confirm == 'n':
+            print("  Da huy."); return
+        if confirm == 'f':
+            print("\n  Nhap so thu tu file muon XOA khoi danh sach (cach nhau boi phay):")
+            self._preview_files(selected_files)
+            raw = input("  So can xoa: ").strip()
+            to_remove = set()
+            for tok in raw.split(","):
+                tok = tok.strip()
+                if tok.isdigit():
+                    idx = int(tok) - 1
+                    if 0 <= idx < len(selected_files):
+                        to_remove.add(idx)
+            selected_files = [f for i, f in enumerate(selected_files) if i not in to_remove]
+            print(f"  Con lai {len(selected_files)} file sau khi loc.")
+            if not selected_files:
+                print("  Danh sach rong, huy upload."); return
+
+        # ── Chọn label ──
         if self.metadata['labels']:
             labels_exist = list(self.metadata['labels'].keys())
             print("\n  Label hien co:")
@@ -958,19 +1372,44 @@ class WebcamVideoCollector:
         if not label_name:
             print("  Ten rong! Huy."); return
 
+        # ── Chọn split ──
+        print("\n  Upload vao split nao?")
+        print("  [1] train  [2] val  [3] test")
+        sp_ch = input("  Chon (mac dinh: train): ").strip()
+        split = {'1': 'train', '2': 'val', '3': 'test'}.get(sp_ch, 'train')
+        print(f"  → split: {split}")
+
         label_dir = os.path.join(self.output_dir, label_name)
         os.makedirs(label_dir, exist_ok=True)
+
+        # ── Upload ──
         success = 0
+        failed  = []
+        print(f"\n  Dang queue {len(selected_files)} file...")
         for i, fp in enumerate(selected_files, 1):
-            fname = os.path.basename(fp)
+            fname        = os.path.basename(fp)
             local_target = os.path.join(label_dir, fname)
             if os.path.abspath(fp) != os.path.abspath(local_target):
                 import shutil
                 shutil.copy2(fp, local_target)
-            print(f"  [{i}/{len(selected_files)}] {fname}...", end=" ", flush=True)
-            ok = upload_to_hf(local_target, label_name, split="train")
-            print("✓" if ok else "✗")
-            if ok: success += 1
+                # Copy cả .json emotion nếu có
+                src_json = os.path.splitext(fp)[0] + ".json"
+                dst_json = os.path.splitext(local_target)[0] + ".json"
+                if os.path.exists(src_json):
+                    shutil.copy2(src_json, dst_json)
+            emo = get_video_emotion(local_target) or "none"
+            queued = upload_to_hf(local_target, label_name, split=split)
+            status = "queued" if queued else "skip(da upload)"
+            print(f"  [{i}/{len(selected_files)}] {fname}  [emo:{emo}]  → {status}")
+            if queued:
+                success += 1
+
+        # ── Flush tất cả 1 lần (1 commit duy nhất) ──
+        if success > 0:
+            print(f"\n  Dang commit {success} file len HuggingFace (split={split})...")
+            _do_flush(f"Upload {success} videos for {label_name} ({split})")
+        else:
+            print(f"\n  Khong co file moi can upload (tat ca da upload truoc do).")
 
         existing = self.metadata['labels'].get(label_name, {}).get('num_videos', 0)
         self.metadata['labels'][label_name] = dict(
@@ -978,8 +1417,16 @@ class WebcamVideoCollector:
         self.metadata['total_videos'] = sum(
             v['num_videos'] for v in self.metadata['labels'].values())
         self._save_meta()
-        print(f"\n  {success}/{len(selected_files)} file upload thanh cong")
+
+        print(f"\n  Tong: {success}/{len(selected_files)} file moi da duoc commit  (split={split})")
+        skipped_count = len(selected_files) - success
+        if skipped_count > 0:
+            print(f"  Bo qua: {skipped_count} file (da upload truoc do)")
         input("\n  ENTER de quay lai...")
+
+    # ══════════════════════════════════════════════════════
+    # ORGANIZE ON EXIT
+    # ══════════════════════════════════════════════════════
 
     def _ask_organize_on_exit(self):
         video_dir   = self.output_dir
