@@ -1,9 +1,0 @@
-{
-  "signs": {
-    "myanmar": {
-      "num_samples": 30,
-      "sequence_length": 30
-    }
-  },
-  "total_samples": 30
-}

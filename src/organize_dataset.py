@@ -1,19 +1,18 @@
 """
- Tổ chức lại dataset vào train/val/test
+Tổ chức lại dataset vào train/val/test
 =============================================================
-Chuyển từ cấu trúc cũ:
-    data/videos/<label>/*.mp4
+Cấu trúc HIỆN TẠI:
+    data/videos/train/train/<label>/*.mp4
 
-Sang cấu trúc mới:
+Cấu trúc SAU KHI CHẠY:
     data/videos/train/<label>/*.mp4
     data/videos/val/<label>/*.mp4
     data/videos/test/<label>/*.mp4
 
 Nguyên tắc chia:
-    - Train : lấy TẤT CẢ video trừ val/test
-    - Val   : 1 video gốc mỗi label (video gần cuối)
-    - Test  : 1 video gốc mỗi label (video cuối cùng)
-    - Nếu label có < 3 video → cảnh báo, không chia
+    - Test  : video cuối cùng mỗi label
+    - Val   : video gần cuối mỗi label
+    - Train : tất cả còn lại
 
 Chạy:
     python organize_dataset.py
@@ -21,210 +20,144 @@ Chạy:
 
 import os
 import shutil
-import json
 from pathlib import Path
 
 # ══════════════════════════════════════════════════════════
 # CẤU HÌNH
 # ══════════════════════════════════════════════════════════
 
-VIDEO_SRC_DIR = 'data/videos'        # thư mục cũ (flat)
-VIDEO_DST_DIR = 'data/videos'        # thư mục mới (có train/val/test)
-MIN_VIDEOS_PER_LABEL = 3             # tối thiểu để chia được
+# Thư mục hiện tại chứa các label  (train/train/)
+LABEL_SRC_DIR = r'D:\NCKhoc\vsl-recognition-project\data\videos\train\train'
 
-VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+# Thư mục gốc — train/ val/ test/ sẽ nằm ở đây  (data/videos/)
+SPLITS_ROOT   = r'D:\NCKhoc\vsl-recognition-project\data\videos'
 
+MIN_VIDEOS    = 3
+VIDEO_EXTS    = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
 
 # ══════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════
 
-def scan_labels(src_dir: str) -> dict:
-    """
-    Quét thư mục cũ, trả về dict:
-    { label_name: [sorted list of video paths] }
-    Bỏ qua các thư mục train/val/test (đã chia rồi).
-    """
+def scan_labels(src: str) -> dict:
     result = {}
     skip   = {'train', 'val', 'test'}
-
-    for entry in sorted(os.scandir(src_dir), key=lambda e: e.name):
+    for entry in sorted(Path(src).iterdir()):
         if not entry.is_dir(): continue
-        if entry.name in skip:  continue
-
+        if entry.name in skip: continue
         videos = sorted([
-            str(fp) for fp in Path(entry.path).glob('*')
-            if fp.suffix.lower() in VIDEO_EXTS
+            str(p) for p in entry.iterdir()
+            if p.suffix.lower() in VIDEO_EXTS
         ])
         if videos:
             result[entry.name] = videos
-
     return result
 
 
-def already_organized(src_dir: str) -> bool:
-    """Kiểm tra đã có cấu trúc train/val/test chưa."""
-    for split in ['train', 'val', 'test']:
-        if os.path.isdir(os.path.join(src_dir, split)):
-            return True
-    return False
+def move_file(src: str, dst: str):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.move(src, dst)
 
 
-def move_video(src: str, dst: str, dry_run: bool = False) -> bool:
-    """Di chuyển 1 file, tạo thư mục đích nếu chưa có."""
-    if dry_run:
-        print(f"    [DRY] {src} → {dst}")
-        return True
-    try:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.move(src, dst)
-        return True
-    except Exception as e:
-        print(f"    LOI: {e}")
-        return False
+def organize():
+    print("\n" + "="*62)
+    print("  ORGANIZE DATASET — CHIA TRAIN / VAL / TEST")
+    print("="*62)
+    print(f"\n  Source : {LABEL_SRC_DIR}")
+    print(f"\n  Output sau khi chia:")
+    print(f"    {SPLITS_ROOT}\\train\\<label>\\")
+    print(f"    {SPLITS_ROOT}\\val\\<label>\\")
+    print(f"    {SPLITS_ROOT}\\test\\<label>\\")
 
+    if not os.path.isdir(LABEL_SRC_DIR):
+        print(f"\n❌ Không tìm thấy: {LABEL_SRC_DIR}"); return
 
-# ══════════════════════════════════════════════════════════
-# MAIN LOGIC
-# ══════════════════════════════════════════════════════════
-
-def organize(src_dir: str = VIDEO_SRC_DIR,
-             dry_run: bool = False) -> dict:
-    """
-    Chia video vào train/val/test.
-    dry_run=True: chỉ in ra sẽ làm gì, không thực sự di chuyển.
-    Trả về dict thống kê.
-    """
-    labels = scan_labels(src_dir)
-
+    labels = scan_labels(LABEL_SRC_DIR)
     if not labels:
-        print("  Khong tim thay label nao trong:", src_dir)
-        return {}
+        print(f"\n❌ Không tìm thấy label nào trong {LABEL_SRC_DIR}"); return
 
-    print(f"\n  Tim thay {len(labels)} labels:")
+    ok, warn = {}, {}
     for lb, vids in labels.items():
-        print(f"    {lb:<30} {len(vids)} video")
+        (ok if len(vids) >= MIN_VIDEOS else warn)[lb] = vids
 
-    # ── Kiểm tra labels đủ video không ──
-    ok_labels   = {}
-    warn_labels = {}
-    for lb, vids in labels.items():
-        if len(vids) >= MIN_VIDEOS_PER_LABEL:
-            ok_labels[lb]   = vids
-        else:
-            warn_labels[lb] = vids
+    # ── Preview bảng ──
+    print(f"\n  Tìm thấy {len(labels)} labels:\n")
+    print(f"  {'Label':<30} {'Tổng':>6} {'Train':>7} {'Val':>5} {'Test':>6}")
+    print("  " + "-"*57)
+    for lb, vids in sorted(ok.items()):
+        n = len(vids)
+        print(f"  {lb:<30} {n:>6} {n-2:>7} {'1':>5} {'1':>6}")
 
-    if warn_labels:
-        print(f"\n  CANH BAO: {len(warn_labels)} label CHUA DU {MIN_VIDEOS_PER_LABEL} video:")
-        for lb, vids in warn_labels.items():
-            print(f"    {lb:<30} chi co {len(vids)} video → BO QUA")
-        print(f"  (Can quay them video cho cac label nay truoc khi chia)")
+    if warn:
+        print(f"\n  ⚠️  Bỏ qua (cần ≥ {MIN_VIDEOS} video):")
+        for lb, vids in warn.items():
+            print(f"     {lb:<30} chỉ có {len(vids)} video")
 
-    if not ok_labels:
-        print("\n  Khong co label nao du video de chia. Thoat.")
-        return {}
+    if not ok:
+        print("\n❌ Không có label nào đủ video."); return
 
-    # ── Chia từng label ──
-    stats  = {}
-    splits = {'train': [], 'val': [], 'test': []}
+    print()
+    confirm = input("  Xác nhận di chuyển file? (y/n): ").strip().lower()
+    if confirm != 'y':
+        print("  Đã huỷ."); return
 
-    for lb, vids in ok_labels.items():
-        n        = len(vids)
-        # Luôn lấy video cuối cùng cho test, gần cuối cho val
-        test_vid = vids[-1]
-        val_vid  = vids[-2]
+    # ── Di chuyển ──
+    print("\n  Đang di chuyển...\n")
+    count = {'train': 0, 'val': 0, 'test': 0}
+
+    for lb, vids in sorted(ok.items()):
+        test_vid   = vids[-1]
+        val_vid    = vids[-2]
         train_vids = vids[:-2]
 
-        splits['train'].append((lb, train_vids))
-        splits['val'].append((lb,  [val_vid]))
-        splits['test'].append((lb, [test_vid]))
+        # val
+        dst = os.path.join(SPLITS_ROOT, 'val', lb, os.path.basename(val_vid))
+        move_file(val_vid, dst)
+        print(f"  [val  ] {lb}/{os.path.basename(val_vid)}")
+        count['val'] += 1
 
-        stats[lb] = {
-            'train': len(train_vids),
-            'val':   1,
-            'test':  1,
-            'total': n,
-        }
+        # test
+        dst = os.path.join(SPLITS_ROOT, 'test', lb, os.path.basename(test_vid))
+        move_file(test_vid, dst)
+        print(f"  [test ] {lb}/{os.path.basename(test_vid)}")
+        count['test'] += 1
 
-    # ── In preview ──
-    print(f"\n  {'Label':<30} {'Train':>7} {'Val':>5} {'Test':>6} {'Tong':>6}")
-    print("  " + "-"*57)
-    for lb, s in stats.items():
-        print(f"  {lb:<30} {s['train']:>7} {s['val']:>5} {s['test']:>6} {s['total']:>6}")
+        # train — move lên data/videos/train/<label>/
+        for vpath in train_vids:
+            dst = os.path.join(SPLITS_ROOT, 'train', lb, os.path.basename(vpath))
+            move_file(vpath, dst)
+            count['train'] += 1
+        print(f"  [train] {lb}/ — {len(train_vids)} video")
 
-    if dry_run:
-        print("\n  [DRY RUN] Khong thuc su di chuyen file.")
-        return stats
+        # Xóa label folder cũ nếu rỗng
+        old_dir = os.path.join(LABEL_SRC_DIR, lb)
+        try:
+            if os.path.isdir(old_dir) and not os.listdir(old_dir):
+                os.rmdir(old_dir)
+        except Exception:
+            pass
 
-    # ── Xác nhận ──
-    confirm = input("\n  Xac nhan di chuyen file? (y/n): ").strip().lower()
-    if confirm != 'y':
-        print("  Da huy.")
-        return {}
+    # Xóa train/train/ nếu rỗng
+    try:
+        if os.path.isdir(LABEL_SRC_DIR) and not os.listdir(LABEL_SRC_DIR):
+            os.rmdir(LABEL_SRC_DIR)
+            # Xóa luôn thư mục cha train/ cũ nếu rỗng
+            old_train = os.path.dirname(LABEL_SRC_DIR)
+            if os.path.isdir(old_train) and not os.listdir(old_train):
+                os.rmdir(old_train)
+            print(f"\n  🗑️  Đã dọn folder cũ: {LABEL_SRC_DIR}")
+    except Exception:
+        pass
 
-    # ── Di chuyển file ──
-    print("\n  Dang di chuyen...")
-    for split_name, label_list in splits.items():
-        for lb, vids in label_list:
-            dst_dir = os.path.join(src_dir, split_name, lb)
-            os.makedirs(dst_dir, exist_ok=True)
-            for vpath in vids:
-                fname = os.path.basename(vpath)
-                dst   = os.path.join(dst_dir, fname)
-                ok    = move_video(vpath, dst)
-                if ok:
-                    print(f"    [{split_name}] {lb}/{fname}")
-
-            # Xóa thư mục label gốc nếu rỗng
-            old_dir = os.path.join(src_dir, lb)
-            try:
-                if os.path.isdir(old_dir) and not os.listdir(old_dir):
-                    os.rmdir(old_dir)
-            except Exception:
-                pass
-
-    print(f"\n  Hoan thanh! Cau truc moi:")
-    print(f"  {src_dir}/train/<label>/*.mp4")
-    print(f"  {src_dir}/val/<label>/*.mp4")
-    print(f"  {src_dir}/test/<label>/*.mp4")
-
-    return stats
-
-
-# ══════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════
-
-def main():
-    print("\n" + "="*60)
-    print(" ORGANIZE DATASET - CHIA TRAIN/VAL/TEST ".center(60, "="))
-    print("="*60)
-    print(f"\n  Thu muc nguon : {VIDEO_SRC_DIR}")
-    print(f"  Toi thieu     : {MIN_VIDEOS_PER_LABEL} video/label")
-    print(f"\n  Quy tac chia:")
-    print(f"    Train : tat ca video tru 2 cai cuoi")
-    print(f"    Val   : video thu N-1 (gan cuoi)")
-    print(f"    Test  : video thu N   (cuoi cung)")
-
-    if not os.path.isdir(VIDEO_SRC_DIR):
-        print(f"\n  LOI: Khong tim thay thu muc: {VIDEO_SRC_DIR}")
-        return
-
-    if already_organized(VIDEO_SRC_DIR):
-        print(f"\n  CANH BAO: Da tim thay thu muc train/val/test trong {VIDEO_SRC_DIR}")
-        print(f"  Co the da chia roi. Kiem tra lai truoc khi chay.")
-        ans = input("  Tiep tuc anyway? (y/n): ").strip().lower()
-        if ans != 'y':
-            return
-
-    # Preview trước
-    print("\n  [Preview - chua di chuyen gi]")
-    organize(VIDEO_SRC_DIR, dry_run=True)
-
-    # Thực sự làm
-    print("\n" + "-"*60)
-    organize(VIDEO_SRC_DIR, dry_run=False)
+    print(f"\n{'='*62}")
+    print(f"  ✅ Hoàn thành!")
+    print(f"  Train : {count['train']} video")
+    print(f"  Val   : {count['val']} video")
+    print(f"  Test  : {count['test']} video")
+    print(f"\n  Cấu trúc mới:")
+    print(f"    data/videos/train/<label>/*.mp4")
+    print(f"    data/videos/val/<label>/*.mp4")
+    print(f"    data/videos/test/<label>/*.mp4")
+    print(f"{'='*62}\n")
 
 
 if __name__ == '__main__':
-    main()
+    organize()
