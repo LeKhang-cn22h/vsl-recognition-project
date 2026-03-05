@@ -31,21 +31,44 @@ def init_hf():
         print("  HuggingFace: CHUA CAI huggingface_hub")
 
 
-def upload_to_hf(local_path: str, label_name: str, split:str ='train') -> bool:
-    """Upload 1 video lên HuggingFace.  split: 'train' | 'val' | 'test'
-    Path trên HF: videos/<split>/<label>/<filename>."""
+def upload_to_hf(local_path: str, label_name: str, split: str = 'train') -> bool:
+    """
+    Upload toàn bộ folder label lên HuggingFace dùng upload_folder (1 commit).
+    Chỉ upload file mới hơn so với lần trước (dùng ignore_patterns không cần,
+    HF Hub tự skip file đã có + hash giống).
+
+    local_path : đường dẫn tới 1 file video bất kỳ trong folder
+                 (để giữ tương thích với code cũ gọi hàm này sau mỗi video)
+    label_name : tên label / thư mục
+    split      : 'train' | 'val' | 'test'
+
+    Upload thực sự xảy ra: folder chứa local_path được upload lên
+        videos/<split>/<label_name>/
+    """
     if _hf_api is None:
         return False
+
+    # Lấy đường dẫn folder chứa file vừa ghi xong
+    folder_path = os.path.dirname(os.path.abspath(local_path))
+
+    if not os.path.isdir(folder_path):
+        print(f"  HF Upload LOI: Khong tim thay folder {folder_path}")
+        return False
+
+    remote_folder = f"videos/{split}/{label_name}"
+
     try:
-        filename    = os.path.basename(local_path)
-        remote_path = f"videos/{split}/{label_name}/{filename}"
-        _hf_api.upload_file(
-            path_or_fileobj=local_path,
-            path_in_repo=remote_path,
+        _hf_api.upload_folder(
+            folder_path=folder_path,
+            path_in_repo=remote_folder,
             repo_id=HF_REPO_ID,
             repo_type="dataset",
+            # Gộp tất cả file vào 1 commit duy nhất → tránh rate limit
+            commit_message=f"Update {split}/{label_name}",
         )
-        print(f"  HF Upload: {remote_path} OK")
+        n_files = len([f for f in os.listdir(folder_path)
+                       if f.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm'))])
+        print(f"  HF Upload: {remote_folder}/ ({n_files} video) OK")
         return True
     except Exception as e:
         print(f"  HF Upload LOI: {e}")

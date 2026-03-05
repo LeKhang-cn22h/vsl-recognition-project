@@ -63,7 +63,7 @@ class Config:
     BATCH_SIZE   = 64
     LR           = 1e-3
     WEIGHT_DECAY = 1e-4
-    PATIENCE     = 20
+    PATIENCE     = 5
     GRAD_CLIP    = 1.0
 
     # ── LR Scheduler ──
@@ -212,6 +212,7 @@ class StaticTrainer:
             'lr':         [],
         }
         self.best_val_acc = 0.0
+        self.best_val_loss = float('inf') 
         self.patience_cnt = 0
         self.ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
 
@@ -265,10 +266,15 @@ class StaticTrainer:
                   f"VlLoss={vl_loss:.4f} VlAcc={vl_acc*100:.1f}% | "
                   f"LR={cur_lr:.2e} | {time.time()-t0:.1f}s")
 
-            # Checkpoint
-            if vl_acc > self.best_val_acc:
-                self.best_val_acc = vl_acc
+            # Checkpoint — cải thiện khi ACC tăng HOẶC LOSS giảm
+            acc_improved  = vl_acc  > self.best_val_acc  + 1e-4
+            loss_improved = vl_loss < self.best_val_loss - 1e-4
+
+            if acc_improved or loss_improved:
+                if acc_improved:  self.best_val_acc  = vl_acc
+                if loss_improved: self.best_val_loss = vl_loss
                 self.patience_cnt = 0
+
                 ckpt_path = os.path.join(
                     self.cfg.CHECKPOINT_DIR,
                     f'static_mlp_best_{self.ts}.pt')
@@ -278,14 +284,14 @@ class StaticTrainer:
                     'val_acc'    : vl_acc,
                     'label_map'  : self.label_map,
                     'cfg': {
-                        'FEAT_DIM'  : self.cfg.FEAT_DIM,
-                        'HIDDEN_1'  : self.cfg.HIDDEN_1,
-                        'HIDDEN_2'  : self.cfg.HIDDEN_2,
-                        'HIDDEN_3'  : self.cfg.HIDDEN_3,
+                        'FEAT_DIM': self.cfg.FEAT_DIM,
+                        'HIDDEN_1': self.cfg.HIDDEN_1,
+                        'HIDDEN_2': self.cfg.HIDDEN_2,
+                        'HIDDEN_3': self.cfg.HIDDEN_3,
                     },
                 }, ckpt_path)
                 print(f"  ✓ Checkpoint → {Path(ckpt_path).name} "
-                      f"(val_acc={vl_acc*100:.2f}%)")
+                    f"(val_acc={vl_acc*100:.2f}%  val_loss={vl_loss:.4f})")
             else:
                 self.patience_cnt += 1
 

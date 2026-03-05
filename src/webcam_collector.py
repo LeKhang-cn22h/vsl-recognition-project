@@ -436,7 +436,7 @@ class WebcamVideoCollector:
         max_duration  = rec_config.get('max_duration',  self.DEFAULT_MAX_DURATION)
         missing_limit = rec_config.get('missing_limit', self.MISSING_FRAMES_TO_STOP)
 
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(1)
         if not cap.isOpened():
             print("  Khong the mo webcam!")
             return
