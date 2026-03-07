@@ -7,9 +7,9 @@ Tich hop voi HFUploader (hf_uploader.py):
   - Batch: nhieu file -> 1 commit / label
 
 Cau truc local:
-    data/processed/train/<label>/*.npy
-    data/processed/val/<label>/*.npy
-    data/processed/test/<label>/*.npy
+    D:/NCKhoc/vsl-recognition-project/data/processed/train/<label>/*.npy
+    D:/NCKhoc/vsl-recognition-project/data/processed/val/<label>/*.npy
+    D:/NCKhoc/vsl-recognition-project/data/processed/test/<label>/*.npy
 
 Cau truc tren HF (giu nguyen):
     processed/train/<label>/*.npy
@@ -53,10 +53,17 @@ except ImportError:
 # CONFIG
 # ══════════════════════════════════════════════════════════════════
 
-LOCAL_DIR     = r"data\processed"
-TRACKING_FILE = r"hf_uploaded_npy.json"
+LOCAL_DIR     = r"D:\NCKhoc\vsl-recognition-project\data\processed"
+TRACKING_FILE = r"D:\NCKhoc\vsl-recognition-project\.hf_uploaded_npy.json"
 SPLITS        = ["train", "val", "test"]
 
+
+# ══════════════════════════════════════════════════════════════════
+# NPY UPLOADER — copy y het pattern cua HFUploader, chi doi:
+#   remote path: "videos/<split>/<label>/<file>"
+#             -> "processed/<split>/<label>/<file>"
+#   tracking_file: ".hf_uploaded.json" -> ".hf_uploaded_npy.json"
+# ══════════════════════════════════════════════════════════════════
 
 class NPYUploader:
     """
@@ -336,39 +343,45 @@ def print_scan_table(scan_data):
 # ══════════════════════════════════════════════════════════════════
 
 def run_upload(uploader, scan_data, dry_run):
+    """
+    Queue TAT CA files truoc, flush 1 LAN CUOI = 1 commit duy nhat.
+    Tranh rate-limit 128 commits/gio cua HuggingFace.
+    """
     summary = []
 
+    # ── BUOC 1: Queue tat ca, chua upload ────────────────────────
+    print(f"  Dang queue files...")
     for split, labels in scan_data.items():
         if not labels:
             continue
-        print(f"\n{'='*60}")
-        print(f"  SPLIT: {split}  ({len(labels)} labels)")
-        print(f"{'='*60}")
-
         for label, info in labels.items():
             label_dir = info['dir']
-            total     = info['count']
-            print(f"\n  [{split}/{label}]  {total} files")
+            total_npy = info['count']
+            queued_n  = uploader.queue_folder(label_dir, label, split)
+            skipped_n = total_npy - queued_n
+            if queued_n > 0:
+                print(f"  + [{split}/{label}]  moi={queued_n}  skip={skipped_n}")
+            else:
+                print(f"  - [{split}/{label}]  skip ca {skipped_n} (da co)")
+            summary.append({'split': split, 'label': label, 'total': total_npy,
+                            'queued': queued_n, 'skipped': skipped_n,
+                            'status': 'skipped' if queued_n == 0 else 'queued'})
 
-            # Queue toan bo folder
-            total_npy   = len([f for f in os.listdir(label_dir) if f.endswith('.npy')])
-            queued_n    = uploader.queue_folder(label_dir, label, split)
-            skipped_n   = total_npy - queued_n
+    # ── BUOC 2: Flush 1 LAN = 1 commit ───────────────────────────
+    total_queued = sum(r['queued'] for r in summary)
+    total_skip   = sum(r['skipped'] for r in summary)
+    print(f"\n  Queue: {total_queued} files moi  |  Skip: {total_skip} (da co)")
 
-            if queued_n == 0:
-                print(f"    Skip ({skipped_n} da upload, hash khong doi)")
-                summary.append({'split': split, 'label': label, 'total': total,
-                                'queued': 0, 'skipped': skipped_n, 'status': 'skipped'})
-                continue
-
-            print(f"    Moi: {queued_n}  |  Skip: {skipped_n}")
-            uploaded = uploader.flush(
-                commit_message = f"Add processed/{split}/{label} ({queued_n} npy files)",
-                dry_run        = dry_run,
-            )
-            status = 'dry_run' if dry_run else ('uploaded' if uploaded > 0 else 'error')
-            summary.append({'split': split, 'label': label, 'total': total,
-                            'queued': queued_n, 'skipped': skipped_n, 'status': status})
+    if total_queued > 0:
+        uploaded = uploader.flush(
+            commit_message=(f"Upload processed/ ({total_queued} npy files) "
+                            f"{datetime.now():%Y-%m-%d %H:%M}"),
+            dry_run=dry_run,
+        )
+        final_status = 'dry_run' if dry_run else ('uploaded' if uploaded > 0 else 'error')
+        for r in summary:
+            if r['status'] == 'queued':
+                r['status'] = final_status
 
     # ── Summary ───────────────────────────────────────────────────
     icons = {'uploaded': 'OK', 'skipped': 'SKIP', 'dry_run': 'DRY', 'error': 'ERR'}
@@ -378,24 +391,24 @@ def run_upload(uploader, scan_data, dry_run):
     print(f"  {'Split':<8} {'Label':<22} {'Total':>6} {'Moi':>5} {'Skip':>5}  Status")
     print(f"  {'-'*56}")
 
-    total_new = total_skip = 0
+    total_new = total_sk = 0
     for r in summary:
         icon = icons.get(r['status'], '???')
         print(f"  {r['split']:<8} {r['label']:<22} {r['total']:>6}"
               f" {r['queued']:>5} {r['skipped']:>5}  [{icon}]")
-        total_new  += r['queued']
-        total_skip += r['skipped']
+        total_new += r['queued']
+        total_sk  += r['skipped']
 
     print(f"  {'-'*56}")
-    print(f"  {len(summary)} labels  |  Moi: {total_new}  |  Skip: {total_skip}")
+    print(f"  {len(summary)} labels  |  Moi: {total_new}  |  Skip: {total_sk}")
 
     if dry_run:
         print(f"\n  [DRY RUN] Chua upload gi! Bo --dry-run de upload that.")
-    elif total_new > 0:
-        print(f"\n  Hoan thanh!")
-        print(f"  Xem: https://huggingface.co/datasets/{uploader.repo_id}")
-    else:
+    elif total_queued == 0:
         print(f"\n  Tat ca da duoc upload truoc do - khong co gi moi!")
+    elif total_new > 0:
+        print(f"\n  Hoan thanh! 1 commit duy nhat.")
+        print(f"  Xem: https://huggingface.co/datasets/{uploader.repo_id}")
     print(f"{'='*60}\n")
 
 
