@@ -27,6 +27,13 @@ Chạy:
   python auto_label_emotion.py --dry-run           # preview không gán
   python auto_label_emotion.py --frames 10         # số frame/video (default 8)
   python auto_label_emotion.py --no-skip           # ghi đè kể cả đã có emotion
+  python auto_label_emotion.py --conf-thresh 0.8   # ngưỡng confidence (default 0.7)
+  python auto_label_emotion.py --no-interactive    # tự động bỏ qua conf thấp, không hỏi
+
+  # Gỡ nhãn các file đã gán có confidence thấp:
+  python auto_label_emotion.py --unlabel-low-conf              # gỡ conf < 0.7
+  python auto_label_emotion.py --unlabel-low-conf --conf-thresh 0.8  # gỡ conf < 0.8
+  python auto_label_emotion.py --unlabel-low-conf --dry-run    # preview trước khi gỡ
 """
 
 import os
@@ -45,8 +52,9 @@ from torchvision.models import efficientnet_b2, EfficientNet_B2_Weights
 # CẤU HÌNH
 # ══════════════════════════════════════════════════════════════════
 
-MODEL_PATH = r'checkpoints/emotion_cnn_best.pth'
-VIDEO_DIR  = r'data/videos'
+MODEL_PATH      = r'checkpoints/emotion_cnn_best.pth'
+VIDEO_DIR       = r'data/videos'
+CONF_THRESH_DEF = 0.70          # ngưỡng confidence mặc định
 
 EMOTION_MAP = {
     "angry":    "angry",
@@ -62,6 +70,8 @@ VIDEO_TO_NPY_EMOTIONS = {
     "angry": 0, "disgust": 1, "fear": 2,
     "happy": 3, "sad": 4,    "surprise": 5, "neutral": 6,
 }
+
+ALL_MAPPED_EMOTIONS = sorted(VIDEO_TO_NPY_EMOTIONS.keys())
 
 SPLITS     = ['train', 'val', 'test']
 VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
@@ -205,9 +215,9 @@ def predict_folder_videos(videos: list, model: EmotionCNN,
     if not all_probs:
         return None
 
-    avg_probs   = np.mean(all_probs, axis=0)
-    best_idx    = int(np.argmax(avg_probs))
-    emotion_cnn = cnn_emotions[best_idx]
+    avg_probs      = np.mean(all_probs, axis=0)
+    best_idx       = int(np.argmax(avg_probs))
+    emotion_cnn    = cnn_emotions[best_idx]
     emotion_mapped = EMOTION_MAP.get(emotion_cnn, emotion_cnn)
 
     return {
@@ -219,6 +229,72 @@ def predict_folder_videos(videos: list, model: EmotionCNN,
         'n_videos':       len(videos),
         'n_frames_used':  total_frames,
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+# INTERACTIVE PROMPT — low confidence
+# ══════════════════════════════════════════════════════════════════
+
+def prompt_low_conf(split: str, label: str,
+                    emotion_mapped: str, confidence: float,
+                    top3_str: str, conf_thresh: float) -> str | None:
+    """
+    Hỏi user khi confidence < conf_thresh.
+
+    Returns:
+        str  → emotion đã chọn (có thể là gán tay)
+        None → bỏ qua (không gán)
+    """
+    print(f"\n    ⚠️  Confidence thấp ({confidence*100:.1f}% < {conf_thresh*100:.0f}%)")
+    print(f"    CNN gợi ý : '{emotion_mapped}'")
+    print(f"    Top probs : {top3_str}")
+    print(f"\n    Chọn hành động cho [{split}/{label}]:")
+    print(f"      [1] Giữ '{emotion_mapped}' (chấp nhận kết quả CNN)")
+    print(f"      [2] Bỏ qua (không gán emotion cho folder này)")
+    print(f"      [3] Gán tay (tự chọn emotion)")
+
+    while True:
+        try:
+            choice = input("    → Nhập lựa chọn (1/2/3): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n    ⚠️  Bỏ qua do interrupt.")
+            return None
+
+        if choice == '1':
+            return emotion_mapped
+
+        elif choice == '2':
+            print(f"    ⏭️  Bỏ qua [{split}/{label}]")
+            return None
+
+        elif choice == '3':
+            print(f"\n    Danh sách emotion hợp lệ:")
+            for i, e in enumerate(ALL_MAPPED_EMOTIONS, 1):
+                print(f"      [{i}] {e}")
+            while True:
+                try:
+                    raw = input("    → Nhập tên hoặc số thứ tự emotion: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n    ⚠️  Bỏ qua do interrupt.")
+                    return None
+
+                # Nhập số thứ tự
+                if raw.isdigit():
+                    idx = int(raw) - 1
+                    if 0 <= idx < len(ALL_MAPPED_EMOTIONS):
+                        chosen = ALL_MAPPED_EMOTIONS[idx]
+                        print(f"    ✏️  Đã chọn gán tay: '{chosen}'")
+                        return chosen
+                    else:
+                        print(f"    ❌ Số không hợp lệ. Nhập 1–{len(ALL_MAPPED_EMOTIONS)}.")
+                # Nhập tên
+                elif raw in ALL_MAPPED_EMOTIONS:
+                    print(f"    ✏️  Đã chọn gán tay: '{raw}'")
+                    return raw
+                else:
+                    print(f"    ❌ '{raw}' không hợp lệ. Chọn: {ALL_MAPPED_EMOTIONS}")
+        else:
+            print("    ❌ Nhập 1, 2 hoặc 3.")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -238,6 +314,19 @@ def get_existing_emotion(video_path: str):
         return None
 
 
+def get_existing_confidence(video_path: str) -> float | None:
+    """Đọc emotion_confidence từ .json. Trả về None nếu chưa có hoặc lỗi."""
+    meta_path = Path(video_path).with_suffix('.json')
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path) as f:
+            data = json.load(f)
+        return data.get('emotion_confidence', None)
+    except Exception:
+        return None
+
+
 def count_labeled(videos: list) -> tuple:
     """Đếm (đã gán, chưa gán). Returns (labeled, unlabeled)."""
     labeled   = sum(1 for v in videos if get_existing_emotion(str(v)) is not None)
@@ -246,7 +335,7 @@ def count_labeled(videos: list) -> tuple:
 
 
 def save_emotion_json(video_path: str, emotion_mapped: str,
-                      prediction_info: dict) -> str:
+                      prediction_info: dict, manual: bool = False) -> str:
     """Lưu emotion vào .json kế bên video."""
     meta_path = str(Path(video_path).with_suffix('.json'))
 
@@ -260,14 +349,128 @@ def save_emotion_json(video_path: str, emotion_mapped: str,
 
     data['emotion']            = emotion_mapped
     data['emotion_id']         = VIDEO_TO_NPY_EMOTIONS.get(emotion_mapped, 0)
-    data['emotion_cnn_raw']    = prediction_info['emotion_cnn']
-    data['emotion_confidence'] = round(prediction_info['confidence'], 4)
-    data['emotion_source']     = 'auto_label_emotion.py'
+    data['emotion_cnn_raw']    = prediction_info.get('emotion_cnn', 'manual')
+    data['emotion_confidence'] = round(prediction_info.get('confidence', 0.0), 4)
+    data['emotion_source']     = 'manual' if manual else 'auto_label_emotion.py'
     data['emotion_updated']    = datetime.now().isoformat()
 
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return meta_path
+
+
+def remove_emotion_json(video_path: str) -> bool:
+    """
+    Xóa các trường emotion khỏi .json kế bên video.
+    Nếu .json rỗng sau khi xóa → xóa luôn file.
+    Returns True nếu thành công.
+    """
+    meta_path = Path(video_path).with_suffix('.json')
+    if not meta_path.exists():
+        return False
+    try:
+        with open(meta_path) as f:
+            data = json.load(f)
+    except Exception:
+        return False
+
+    emotion_keys = [
+        'emotion', 'emotion_id', 'emotion_cnn_raw',
+        'emotion_confidence', 'emotion_source', 'emotion_updated',
+    ]
+    changed = any(k in data for k in emotion_keys)
+    for k in emotion_keys:
+        data.pop(k, None)
+
+    if not data:
+        meta_path.unlink()          # file rỗng → xóa hẳn
+    else:
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    return changed
+
+
+# ══════════════════════════════════════════════════════════════════
+# UNLABEL LOW-CONFIDENCE
+# ══════════════════════════════════════════════════════════════════
+
+def unlabel_low_conf(video_dir: str, splits: list, label_filter: list,
+                     conf_thresh: float, dry_run: bool):
+    """
+    Duyệt toàn bộ .json, tìm file có emotion_confidence < conf_thresh
+    và gỡ nhãn (xóa các trường emotion).
+    """
+    video_dir = Path(video_dir)
+    removed   = []
+    skipped   = []
+
+    print(f"\n{'='*62}")
+    print(f"  UNLABEL LOW-CONFIDENCE  (ngưỡng: {conf_thresh*100:.0f}%)")
+    print(f"{'='*62}")
+
+    for split in splits:
+        split_dir = video_dir / split
+        if not split_dir.exists():
+            continue
+
+        label_dirs = sorted([d for d in split_dir.iterdir() if d.is_dir()])
+        if label_filter:
+            label_dirs = [d for d in label_dirs if d.name in label_filter]
+
+        for label_dir in label_dirs:
+            label  = label_dir.name
+            videos = sorted([p for p in label_dir.iterdir()
+                              if p.suffix.lower() in VIDEO_EXTS])
+
+            folder_removed = []
+            folder_skipped = []
+
+            for vpath in videos:
+                conf = get_existing_confidence(str(vpath))
+                if conf is None:
+                    continue                         # chưa có nhãn → bỏ qua
+
+                emotion = get_existing_emotion(str(vpath))
+
+                if conf < conf_thresh:
+                    folder_removed.append((vpath, emotion, conf))
+                else:
+                    folder_skipped.append((vpath, emotion, conf))
+
+            if not folder_removed:
+                continue
+
+            print(f"\n  [{split}/{label}]  "
+                  f"{len(folder_removed)} file cần gỡ  |  "
+                  f"{len(folder_skipped)} file giữ lại")
+
+            for vpath, emotion, conf in folder_removed:
+                tag = "[DRY RUN] " if dry_run else ""
+                print(f"    {tag}🗑️  {vpath.name}  "
+                      f"→ '{emotion}'  conf={conf*100:.1f}%")
+                if not dry_run:
+                    remove_emotion_json(str(vpath))
+
+            removed.extend(folder_removed)
+            skipped.extend(folder_skipped)
+
+    # Summary
+    print(f"\n{'='*62}")
+    print(f"  TỔNG KẾT UNLABEL")
+    print(f"{'='*62}")
+    print(f"  Đã gỡ nhãn : {len(removed)} file  (conf < {conf_thresh*100:.0f}%)")
+    print(f"  Giữ lại    : {len(skipped)} file  (conf ≥ {conf_thresh*100:.0f}%)")
+
+    if dry_run:
+        print(f"\n  ⚠️  DRY RUN — chưa xóa gì cả!")
+        print(f"  Chạy lại không có --dry-run để thực sự gỡ nhãn.")
+    else:
+        if removed:
+            print(f"\n  ✅ Đã gỡ nhãn xong.")
+            print(f"  Bạn có thể chạy lại auto_label_emotion.py để gán lại.")
+        else:
+            print(f"\n  ✅ Không có file nào cần gỡ.")
+    print(f"{'='*62}\n")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -276,6 +479,7 @@ def save_emotion_json(video_path: str, emotion_mapped: str,
 
 def process_all(video_dir: str, splits: list, label_filter: list,
                 n_frames: int, dry_run: bool, skip_labeled: bool,
+                conf_thresh: float, interactive: bool,
                 model: EmotionCNN, cnn_emotions: list):
 
     video_dir = Path(video_dir)
@@ -354,6 +558,42 @@ def process_all(video_dir: str, splits: list, label_filter: list,
             print(f"    Frames used: {result['n_frames_used']} "
                   f"({n_frames} frames × {result['n_videos']} videos)")
 
+            # ── Xử lý confidence thấp ─────────────────────────────
+            is_manual = False
+            if confidence < conf_thresh:
+                if dry_run:
+                    # Trong dry-run chỉ báo, không hỏi
+                    print(f"    ⚠️  [DRY RUN] Confidence thấp "
+                          f"({confidence*100:.1f}% < {conf_thresh*100:.0f}%)"
+                          f" — sẽ hỏi khi chạy thật")
+                elif interactive:
+                    chosen = prompt_low_conf(split, label, emotion_mapped,
+                                             confidence, top3_str, conf_thresh)
+                    if chosen is None:
+                        # User chọn bỏ qua
+                        summary.append({
+                            'split': split, 'label': label, 'n_videos': n_vids,
+                            'n_new': 0, 'cnn': emotion_cnn,
+                            'mapped': emotion_mapped,
+                            'confidence': confidence, 'status': 'skipped_low_conf',
+                        })
+                        continue
+                    # Nếu user chọn gán tay (khác với CNN)
+                    is_manual = (chosen != emotion_mapped)
+                    emotion_mapped = chosen
+                    result['emotion_cnn'] = emotion_cnn   # giữ gốc
+                    result['emotion_mapped'] = emotion_mapped
+                else:
+                    # --no-interactive: tự động bỏ qua
+                    print(f"    ⏭️  Bỏ qua (conf thấp, --no-interactive)")
+                    summary.append({
+                        'split': split, 'label': label, 'n_videos': n_vids,
+                        'n_new': 0, 'cnn': emotion_cnn,
+                        'mapped': emotion_mapped,
+                        'confidence': confidence, 'status': 'skipped_low_conf',
+                    })
+                    continue
+
             n_will = len(videos_to_predict)
             n_skip = n_vids - n_will
 
@@ -362,9 +602,10 @@ def process_all(video_dir: str, splits: list, label_filter: list,
                       + (f"  (bỏ qua {n_skip} đã có)" if n_skip > 0 else ""))
             else:
                 for vpath in videos_to_predict:
-                    save_emotion_json(str(vpath), emotion_mapped, result)
-                skip_note = f"  (⏭️ skip {n_skip} đã có)" if n_skip > 0 else ""
-                print(f"    ✅ Đã gán '{emotion_mapped}' → {n_will} file .json{skip_note}")
+                    save_emotion_json(str(vpath), emotion_mapped, result, manual=is_manual)
+                source_tag = "✏️ (gán tay)" if is_manual else "✅"
+                skip_note  = f"  (⏭️ skip {n_skip} đã có)" if n_skip > 0 else ""
+                print(f"    {source_tag} Đã gán '{emotion_mapped}' → {n_will} file .json{skip_note}")
 
             summary.append({
                 'split':      split,
@@ -374,7 +615,7 @@ def process_all(video_dir: str, splits: list, label_filter: list,
                 'cnn':        emotion_cnn,
                 'mapped':     emotion_mapped,
                 'confidence': confidence,
-                'status':     'processed',
+                'status':     'manual' if is_manual else 'processed',
             })
 
     # ── Summary table ─────────────────────────────────────────────
@@ -382,23 +623,35 @@ def process_all(video_dir: str, splits: list, label_filter: list,
     print(f"  {'TỔNG KẾT':^58}")
     print(f"{'='*62}")
     print(f"  {'Split':<8} {'Label':<20} {'Total':>6} {'Mới':>5} "
-          f"{'Skip':>5}  {'→ Mapped':<12} {'Conf':>7}")
-    print(f"  {'-'*60}")
+          f"{'Skip':>5}  {'→ Mapped':<15} {'Conf':>7}")
+    print(f"  {'-'*65}")
 
     for r in summary:
         conf_str = f"{r['confidence']*100:>6.1f}%" if r['confidence'] >= 0 else "    — "
         n_new    = r.get('n_new', 0)
         n_skip   = r['n_videos'] - n_new
-        status   = "⏭️ " if r.get('status') == 'skipped' else "✅ "
+
+        if r.get('status') == 'skipped':
+            status = "⏭️ "
+        elif r.get('status') == 'skipped_low_conf':
+            status = "⚠️ "
+        elif r.get('status') == 'manual':
+            status = "✏️ "
+        else:
+            status = "✅ "
+
         print(f"  {r['split']:<8} {r['label']:<20} {r['n_videos']:>6} {n_new:>5} "
-              f"{n_skip:>5}  {status}{r['mapped']:<10} {conf_str}")
+              f"{n_skip:>5}  {status}{r['mapped']:<13} {conf_str}")
 
     total_vids = sum(r['n_videos'] for r in summary)
     total_new  = sum(r.get('n_new', 0) for r in summary)
     total_skip = total_vids - total_new
-    print(f"  {'-'*60}")
+    print(f"  {'-'*65}")
     print(f"  {len(summary)} folders  |  {total_vids} videos  |  "
           f"Gán mới: {total_new}  |  Skip: {total_skip}")
+
+    # Legend
+    print(f"\n  Legend: ✅ auto  ✏️ manual  ⚠️ bỏ qua (conf thấp)  ⏭️ skip (đã có)")
 
     if dry_run:
         print(f"\n  ⚠️  DRY RUN — chưa gán gì cả!")
@@ -419,13 +672,20 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 Ví dụ:
-  python auto_label_emotion.py                     # tất cả (tự skip đã gán)
-  python auto_label_emotion.py --split train       # chỉ train
-  python auto_label_emotion.py --split train val   # train + val
-  python auto_label_emotion.py --label ai lo_so    # chỉ 2 labels
-  python auto_label_emotion.py --dry-run           # preview không gán
-  python auto_label_emotion.py --frames 12         # 12 frames/video
-  python auto_label_emotion.py --no-skip           # ghi đè kể cả đã có
+  python auto_label_emotion.py                          # tất cả (tự skip đã gán)
+  python auto_label_emotion.py --split train            # chỉ train
+  python auto_label_emotion.py --split train val        # train + val
+  python auto_label_emotion.py --label ai lo_so         # chỉ 2 labels
+  python auto_label_emotion.py --dry-run                # preview không gán
+  python auto_label_emotion.py --frames 12              # 12 frames/video
+  python auto_label_emotion.py --no-skip                # ghi đè kể cả đã có
+  python auto_label_emotion.py --conf-thresh 0.8        # hỏi khi conf < 80%
+  python auto_label_emotion.py --no-interactive         # tự động bỏ conf thấp, không hỏi
+
+  # Gỡ nhãn confidence thấp:
+  python auto_label_emotion.py --unlabel-low-conf                   # gỡ conf < 70%
+  python auto_label_emotion.py --unlabel-low-conf --conf-thresh 0.8 # gỡ conf < 80%
+  python auto_label_emotion.py --unlabel-low-conf --dry-run         # preview trước
         """
     )
     parser.add_argument('--model',     default=MODEL_PATH,
@@ -443,6 +703,17 @@ Ví dụ:
                         help='Preview kết quả, không gán emotion')
     parser.add_argument('--no-skip',   action='store_true',
                         help='Ghi đè tất cả, kể cả video đã có emotion')
+    parser.add_argument('--conf-thresh', type=float, default=CONF_THRESH_DEF,
+                        metavar='THRESH',
+                        help=f'Ngưỡng confidence (0–1, default: {CONF_THRESH_DEF}). '
+                             f'Dưới ngưỡng → hỏi user (hoặc bỏ nếu --no-interactive)')
+    parser.add_argument('--no-interactive', action='store_true',
+                        help='Không hỏi khi conf thấp — tự động bỏ qua những folder đó')
+    # ── Unlabel mode ──────────────────────────────────────────────
+    parser.add_argument('--unlabel-low-conf', action='store_true',
+                        help='Gỡ nhãn tất cả file đã gán có confidence < --conf-thresh.\n'
+                             'Kết hợp với --dry-run để preview trước khi xóa.')
+
     args = parser.parse_args()
 
     print("\n" + "="*62)
@@ -452,27 +723,49 @@ Ví dụ:
     print(f"  Video dir   : {args.video_dir}")
     print(f"  Splits      : {args.split}")
     print(f"  Labels      : {args.label or 'all'}")
-    print(f"  Frames/v    : {args.frames}")
-    print(f"  Dry run     : {args.dry_run}")
-    print(f"  Skip labeled: {not args.no_skip}"
-          + ("" if not args.no_skip else "  ← --no-skip: sẽ ghi đè tất cả"))
-    print(f"\n  Emotion mapping (CNN → video_to_npy):")
-    for k, v in EMOTION_MAP.items():
-        tag = " (same)" if k == v else f" → {v}"
-        print(f"    {k:<12}{tag}")
+    print(f"  Conf thresh : {args.conf_thresh*100:.0f}%")
 
-    model, cnn_emotions = load_model(args.model)
+    if args.unlabel_low_conf:
+        # ── CHẾ ĐỘ GỠ NHÃN ───────────────────────────────────────
+        print(f"  Mode        : UNLABEL LOW-CONF")
+        print(f"  Dry run     : {args.dry_run}")
+        print("="*62)
 
-    process_all(
-        video_dir    = args.video_dir,
-        splits       = args.split,
-        label_filter = args.label,
-        n_frames     = args.frames,
-        dry_run      = args.dry_run,
-        skip_labeled = not args.no_skip,
-        model        = model,
-        cnn_emotions = cnn_emotions,
-    )
+        unlabel_low_conf(
+            video_dir    = args.video_dir,
+            splits       = args.split,
+            label_filter = args.label,
+            conf_thresh  = args.conf_thresh,
+            dry_run      = args.dry_run,
+        )
+    else:
+        # ── CHẾ ĐỘ GÁN NHÃN ──────────────────────────────────────
+        print(f"  Frames/v    : {args.frames}")
+        print(f"  Dry run     : {args.dry_run}")
+        print(f"  Skip labeled: {not args.no_skip}"
+              + ("" if not args.no_skip else "  ← --no-skip: sẽ ghi đè tất cả"))
+        print(f"  Interactive : {not args.no_interactive}"
+              + ("  ← sẽ hỏi khi conf thấp" if not args.no_interactive
+                 else "  ← --no-interactive: tự bỏ qua conf thấp"))
+        print(f"\n  Emotion mapping (CNN → video_to_npy):")
+        for k, v in EMOTION_MAP.items():
+            tag = " (same)" if k == v else f" → {v}"
+            print(f"    {k:<12}{tag}")
+
+        model, cnn_emotions = load_model(args.model)
+
+        process_all(
+            video_dir    = args.video_dir,
+            splits       = args.split,
+            label_filter = args.label,
+            n_frames     = args.frames,
+            dry_run      = args.dry_run,
+            skip_labeled = not args.no_skip,
+            conf_thresh  = args.conf_thresh,
+            interactive  = not args.no_interactive,
+            model        = model,
+            cnn_emotions = cnn_emotions,
+        )
 
 
 if __name__ == '__main__':
