@@ -27,10 +27,10 @@ from pathlib import Path
 # ══════════════════════════════════════════════════════════
 
 # Thư mục hiện tại chứa các label  (train/train/)
-LABEL_SRC_DIR = r'D:\NCKhoc\vsl-recognition-project\data\videos\train\train'
+LABEL_SRC_DIR = r'data\videos\train\train'
 
 # Thư mục gốc — train/ val/ test/ sẽ nằm ở đây  (data/videos/)
-SPLITS_ROOT   = r'D:\NCKhoc\vsl-recognition-project\data\videos'
+SPLITS_ROOT   = r'data\videos'
 
 MIN_VIDEOS    = 3
 VIDEO_EXTS    = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
