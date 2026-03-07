@@ -582,7 +582,7 @@ def mirror_sequence(seq: np.ndarray) -> np.ndarray:
 
 class VideoToNPY:
 
-    def __init__(self, video_dir="videos", output_dir="data/processed",
+    def __init__(self, video_dir="data/videos", output_dir="data/processed",
                  default_emotion=None, labels=None):
         self.video_dir       = video_dir
         self.output_dir      = output_dir
@@ -895,7 +895,7 @@ Ví dụ:
   python src/video_to_npy.py --verify data/processed/train/angry/angry_0000_org.npy
         """
     )
-    parser.add_argument("--video_dir",       default="videos")
+    parser.add_argument("--video_dir",       default="data/videos")
     parser.add_argument("--output_dir",      default="data/processed")
     parser.add_argument("--clean",           action="store_true")
     parser.add_argument("--labels",          nargs="+", default=None)
