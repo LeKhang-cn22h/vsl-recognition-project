@@ -1,123 +1,136 @@
 """
-vsl/config.py - Cấu hình toàn bộ hệ thống VSL
-================================================
-Import ở bất kỳ đâu:
-    from vsl.config import cfg, FACE_KEY_INDICES, KEY_BLENDSHAPES
+vsl_config_v3.py - Config chung cho toàn bộ pipeline VSL
+=========================================================
+FEATURES: 178 dim
+  - pose:    45 dim (15 điểm × 3)
+  - hands:  126 dim (21 × 2 × 3)
+  - emotion:  7 dim (one-hot, do người dùng chọn khi quay)
+
+Emotions: angry, disgust, fear, happy, sad, surprise, neutral
 """
 
-import torch
-
-# ── MediaPipe model download URLs ──
-MODEL_URLS = {
-    'hand_landmarker.task': (
-        'https://storage.googleapis.com/mediapipe-models/'
-        'hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'),
-    'pose_landmarker_heavy.task': (
-        'https://storage.googleapis.com/mediapipe-models/'
-        'pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task'),
-    'face_landmarker.task': (
-        'https://storage.googleapis.com/mediapipe-models/'
-        'face_landmarker/face_landmarker/float16/1/face_landmarker.task'),
-}
-
-# ── 30 face landmark indices quan trọng cho VSL ──
-FACE_KEY_INDICES = [
-    # Lông mày (10)
-    70, 63, 105, 66, 107,
-    336, 296, 334, 293, 300,
-    # Mắt (8)
-    33, 159, 145, 133,
-    263, 386, 374, 362,
-    # Miệng (8)
-    13, 14, 61, 291, 0, 17, 78, 308,
-    # Tham chiếu (4)
-    1, 4, 10, 152,
-]
-
-# ── 17 blendshapes quan trọng cho VSL ──
-KEY_BLENDSHAPES = [
-    'jawOpen',
-    'mouthSmileLeft', 'mouthSmileRight',
-    'mouthFrownLeft', 'mouthFrownRight',
-    'mouthPucker', 'cheekPuff',
-    'eyeBlinkLeft', 'eyeBlinkRight',
-    'eyeWideLeft', 'eyeWideRight',
-    'eyeSquintLeft', 'eyeSquintRight',
-    'browInnerUp',
-    'browDownLeft', 'browDownRight',
-    'noseSneerLeft',
-]
-# 14 vùng mặt — face landmark indices
-# Dùng trong compute_interactions()
-FACE_REGION_INDICES = {
-    'tran':          [10, 67, 297],       # trán
-    'thai_duong_T':  [162, 21],           # thái dương trái
-    'thai_duong_P':  [389, 251],          # thái dương phải
-    'chan_may_T':    [70, 63, 105],       # chân mày trái
-    'chan_may_P':    [300, 293, 334],     # chân mày phải
-    'mat_T':         [159, 145],          # mắt trái
-    'mat_P':         [386, 374],          # mắt phải
-    'mui':           [4, 6],              # mũi
-    'ma_T':          [50, 117],           # má trái
-    'ma_P':          [280, 346],          # má phải
-    'mieng':         [13, 14],            # miệng
-    'cam':           [152, 175],          # cằm
-    'lo_tai_T':      [234, 93],           # lỗ tai trái
-    'lo_tai_P':      [454, 323],          # lỗ tai phải
-}
-FACE_REGION_NAMES = list(FACE_REGION_INDICES.keys())  # 14 vùng
-
-# 8 vùng body — pose landmark indices
-# Dùng trong compute_interactions()
-BODY_REGION_INDICES = {
-    'dau':       [0],           # đầu
-    'vai_T':     [11],          # vai trái
-    'vai_P':     [12],          # vai phải
-    'nguc':      [11, 12],      # ngực (giữa 2 vai)
-    'khuyu_T':   [13],          # khuỷu tay trái
-    'khuyu_P':   [14],          # khuỷu tay phải
-    'hong_T':    [23],          # hông trái
-    'hong_P':    [24],          # hông phải
-}
-BODY_REGION_NAMES = list(BODY_REGION_INDICES.keys())  # 8 vùng
-
-# Ngưỡng "chạm" — dùng cho binary flag
-TOUCH_THRESHOLD = 0.06
-
-class Config:
-    # ── Sequence ──
-    SEQ_LEN  = 64
-    FEAT_DIM = 346  # 75 + 90 + 126 + 0 (bỏ blend) + 55
-
-    # ── Feature layout (start:end index trong vector 346) ──
-    POSE_START,     POSE_END     = 0,   75
-    FACE_START,     FACE_END     = 75,  165
-    HAND_START,     HAND_END     = 165, 291
-    BLEND_START,    BLEND_END    = 291, 291
-    INTERACT_START, INTERACT_END = 291, 346
-
-    # ── Model architecture ──
-    D_MODEL           = 256
-    SPATIAL_HEADS     = 8
-    SPATIAL_LAYERS    = 3
-    SPATIAL_FF_DIM    = 512
-    SPATIAL_DROPOUT   = 0.1
-    TEMPORAL_HEADS    = 8
-    TEMPORAL_LAYERS   = 4
-    TEMPORAL_FF_DIM   = 512
-    TEMPORAL_DROPOUT  = 0.1
-    CLASSIFIER_HIDDEN = 256
-    DROPOUT_FINAL     = 0.3
-
-    # ── Device ──
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # ── Inference defaults ──
-    CONFIDENCE_THR  = 0.60
-    MOTION_THR      = 0.015
-    CONSEC_THR      = 3
-    SMOOTH_WINDOW   = 5
-    TOP_K           = 5
+import numpy as np
 
 
-cfg = Config()
+class VSLConfig:
+    # ─── Sequence ───
+    SEQ_LEN = 64
+
+    # ─── Pose: 15 điểm quan trọng ───
+    POSE_KEY_INDICES = [
+        0,          # nose
+        11, 12,     # shoulders
+        13, 14,     # elbows
+        15, 16,     # wrists
+        17, 18,     # pinky
+        19, 20,     # index
+        21, 22,     # thumb
+        23, 24,     # hips
+    ]
+    POSE_DIM = 15 * 3  # 45
+
+    # ─── Hands ───
+    HAND_LANDMARKS = 21
+    NUM_HANDS = 2
+    HAND_DIM = HAND_LANDMARKS * NUM_HANDS * 3  # 126
+
+    # ─── Emotion ───
+    EMOTIONS = {
+        "angry":    0,
+        "disgust":  1,
+        "fear":     2,
+        "happy":    3,
+        "sad":      4,
+        "surprise": 5,
+        "neutral":  6,
+    }
+    EMOTION_DIM = len(EMOTIONS)  # 7
+
+    # ─── Tổng features ───
+    FEAT_DIM = POSE_DIM + HAND_DIM + EMOTION_DIM  # 45 + 126 + 7 = 178
+
+    # ─── Index ranges ───
+    POSE_START, POSE_END = 0, 45
+    HAND_START, HAND_END = 45, 171
+    LEFT_HAND_START,  LEFT_HAND_END  = 45,  108
+    RIGHT_HAND_START, RIGHT_HAND_END = 108, 171
+    EMOTION_START, EMOTION_END = 171, 178
+
+    # ─── Paths ───
+    VIDEO_DIR      = "videos"
+    DATA_DIR       = "data/processed"
+    CHECKPOINT_DIR = "checkpoints"
+    LOG_DIR        = "logs"
+
+    # ─── Training ───
+    BATCH_SIZE = 32
+    EPOCHS     = 100
+    LR         = 1e-3
+    PATIENCE   = 15
+
+    # ─── Model ───
+    HIDDEN_DIM = 256
+    NUM_LAYERS = 3
+    DROPOUT    = 0.3
+
+    @classmethod
+    def print_info(cls):
+        print(f"""
+╔═══════════════════════════════════════════════════════════╗
+║                   VSL CONFIG v3                           ║
+╠═══════════════════════════════════════════════════════════╣
+║  FEATURES: {cls.FEAT_DIM} dim                                       ║
+║    ├── pose:    {cls.POSE_DIM} dim  (0:{cls.POSE_END})                       ║
+║    ├── hands:  {cls.HAND_DIM} dim ({cls.HAND_START}:{cls.HAND_END})                     ║
+║    └── emotion:  {cls.EMOTION_DIM} dim ({cls.EMOTION_START}:{cls.EMOTION_END})                     ║
+║                                                           ║
+║  SEQUENCE: {cls.SEQ_LEN} frames                                     ║
+║  EMOTIONS: {list(cls.EMOTIONS.keys())}   ║
+╚═══════════════════════════════════════════════════════════╝
+        """)
+
+
+cfg = VSLConfig()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# EMOTION ENCODING / DECODING
+# ═══════════════════════════════════════════════════════════════════
+
+def encode_emotion(emotion_name: str) -> np.ndarray:
+    """Emotion name → one-hot vector (7 dim)."""
+    vec = np.zeros(cfg.EMOTION_DIM, dtype=np.float32)
+    vec[cfg.EMOTIONS.get(emotion_name, cfg.EMOTIONS["neutral"])] = 1.0
+    return vec
+
+
+def decode_emotion(emotion_vec: np.ndarray) -> str:
+    """One-hot vector → emotion name."""
+    idx = int(np.argmax(emotion_vec))
+    for name, i in cfg.EMOTIONS.items():
+        if i == idx:
+            return name
+    return "neutral"
+
+
+def get_emotion_from_filename(filename: str) -> str:
+    """Parse emotion từ tên file: label_emotion_timestamp.mp4"""
+    import os
+    name = os.path.splitext(os.path.basename(filename))[0]
+    for emotion in cfg.EMOTIONS:
+        if f"_{emotion}_" in name or name.endswith(f"_{emotion}"):
+            return emotion
+    return "neutral"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST
+# ═══════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    cfg.print_info()
+    print("  Testing emotion encoding:")
+    for emo in cfg.EMOTIONS:
+        vec = encode_emotion(emo)
+        decoded = decode_emotion(vec)
+        print(f"    {emo:10s} → idx={cfg.EMOTIONS[emo]}  decoded={decoded}")

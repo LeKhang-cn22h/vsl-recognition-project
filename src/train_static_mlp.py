@@ -5,8 +5,8 @@ Input : data/static/ (sinh ra từ video_to_npy_static.py)
         mỗi file .npy có shape (96,)
 
 Output:
-    checkpoints/static_mlp_best_<timestamp>.pt
-    logs/static_history_<timestamp>.json
+    checkpoints/static_mlp_best.pt
+    logs/static_history.json
     charts/static_*
 
 Chạy:
@@ -214,8 +214,6 @@ class StaticTrainer:
         self.best_val_acc = 0.0
         self.best_val_loss = float('inf') 
         self.patience_cnt = 0
-        self.ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-
         os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
         os.makedirs(cfg.LOG_DIR,        exist_ok=True)
         os.makedirs(cfg.CHART_DIR,      exist_ok=True)
@@ -277,7 +275,7 @@ class StaticTrainer:
 
                 ckpt_path = os.path.join(
                     self.cfg.CHECKPOINT_DIR,
-                    f'static_mlp_best_{self.ts}.pt')
+                    f'static_mlp_best.pt')
                 torch.save({
                     'epoch'      : epoch,
                     'model_state': self.model.state_dict(),
@@ -301,7 +299,7 @@ class StaticTrainer:
 
         # Save log
         log_path = os.path.join(
-            self.cfg.LOG_DIR, f'static_history_{self.ts}.json')
+            self.cfg.LOG_DIR, f'static_history.json')
         with open(log_path, 'w', encoding='utf-8') as f:
             json.dump(self.history, f, indent=2)
         print(f"  Log → {log_path}")
@@ -331,7 +329,7 @@ class StaticTrainer:
 
         # Save report
         rpt = os.path.join(
-            self.cfg.LOG_DIR, f'static_report_{self.ts}.txt')
+            self.cfg.LOG_DIR, f'static_report.txt')
         with open(rpt, 'w', encoding='utf-8') as f:
             f.write(report)
 
@@ -342,7 +340,7 @@ class StaticTrainer:
 
     def _save(self, name):
         path = os.path.join(
-            self.cfg.CHART_DIR, f'static_{name}_{self.ts}.png')
+            self.cfg.CHART_DIR, f'static_{name}.png')
         plt.savefig(path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close()
         print(f"  [Chart] {path}")
@@ -525,7 +523,7 @@ def main():
     trainer.evaluate_and_plot()
 
     print(f"\n  HOAN THANH!")
-    print(f"  Ckpt  : checkpoints/static_mlp_best_<timestamp>.pt")
+    print(f"  Ckpt  : checkpoints/static_mlp_best.pt")
     print(f"  Charts: charts/static_*/\n")
 
 

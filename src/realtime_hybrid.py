@@ -1113,14 +1113,14 @@ def main():
     print()
 
     # ── Load models ───────────────────────────────────────────────
-    s_ckpt = args.static_ckpt or _latest('static_mlp_best_*.pt')
+    s_ckpt = args.static_ckpt or _latest('static_mlp_best.pt')
     if not s_ckpt or not os.path.exists(s_ckpt):
         print("  [ERROR] Khong tim thay static checkpoint")
         sys.exit(1)
     smodel, smap = load_static(s_ckpt, device)
     s_i2l = {v: k for k, v in smap.items()}   # đảo label_map: index → string
 
-    d_ckpt = args.dynamic_ckpt or _latest('bilstm_best_*.pt')
+    d_ckpt = args.dynamic_ckpt or _latest('bilstm_best.pt')
     if not d_ckpt or not os.path.exists(d_ckpt):
         print("  [ERROR] Khong tim thay bilstm checkpoint")
         sys.exit(1)
