@@ -7,7 +7,6 @@ pandas
 matplotlib
 seaborn
 tqdm
-torch
 huggingface_hub
 python-dotenv
 ai-edge-torch
