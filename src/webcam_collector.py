@@ -10,7 +10,9 @@ Menu:
     3. Tiếp tục thu video cho nhãn có sẵn
     4. Thu video IDLE (nghỉ / không ký hiệu)
     5. Upload video có sẵn lên HuggingFace
-    6. Lưu và thoát
+    6. Gán emotion cho video có sẵn
+    7. Gộp video thành ZIP và upload lên HuggingFace   ← MỚI
+    8. Lưu và thoát
 
 Thay đổi v2:
     - Bỏ qua frame khi thiếu bộ phận trong lúc recording (không ghi frame đó)
@@ -28,6 +30,12 @@ Thay đổi v4 (emotion + upload):
     - Emotion được lưu vào file .json cùng với video (tương thích video_to_npy.py)
     - Upload file MP4 được cải tiến: chọn từng file hoặc nhóm, lọc theo nhãn,
       xem preview danh sách trước khi upload
+
+Thay đổi v5 (zip + upload zip):
+    - Thêm hàm zip_label_videos(): gộp MP4 của 1 nhãn thành file ZIP
+    - Thêm hàm upload_zip_to_hf(): đẩy file ZIP lên HuggingFace dataset
+    - Thêm menu mục 7: gộp & upload ZIP, hỗ trợ chọn 1 nhãn / tất cả nhãn,
+      chọn split, xem preview trước khi upload
 """
 
 import cv2
@@ -35,6 +43,7 @@ import json
 import os
 import time
 import urllib.request
+import zipfile
 from datetime import datetime
 
 import mediapipe as mp
@@ -50,7 +59,6 @@ from collector import (
 )
 
 # Import flush_hf — tương thích với hf_uploader.py (queue-based)
-# Nếu upload_to_hf chỉ queue chứ không gửi ngay, cần gọi flush sau.
 _flush_hf = None
 for _mod in ('collector.hf_upload', 'collector.hf_uploader', 'hf_uploader'):
     try:
@@ -138,7 +146,6 @@ def ask_emotion(default: str = None) -> str:
             chosen = EMOTIONS_LIST[int(raw) - 1]
             print(f"  → Emotion: {chosen}")
             return chosen
-        # Cho phép nhập tên trực tiếp
         if raw in EMOTIONS:
             print(f"  → Emotion: {raw}")
             return raw
@@ -178,16 +185,174 @@ def get_video_emotion(video_path: str):
 
 
 # ══════════════════════════════════════════════════════════
+# ZIP HELPERS  (v5 - MỚI)
+# ══════════════════════════════════════════════════════════
+
+def zip_label_videos(label_dir: str, label_name: str,
+                     zip_dir: str = None,
+                     include_json: bool = True) -> str | None:
+    """
+    Gộp tất cả file MP4 (và .json emotion tương ứng) của 1 nhãn thành 1 file ZIP.
+
+    Args:
+        label_dir   : Đường dẫn thư mục chứa video của nhãn (vd: data/videos/xin_chao)
+        label_name  : Tên nhãn (vd: xin_chao)
+        zip_dir     : Thư mục lưu file zip (mặc định: cùng cấp với label_dir)
+        include_json: Có đóng gói kèm file .json emotion không (mặc định: True)
+
+    Returns:
+        Đường dẫn file ZIP đã tạo, hoặc None nếu không có video.
+    """
+    # Quét file MP4 trong label_dir
+    mp4_files = sorted([
+        f for f in os.listdir(label_dir) if f.endswith('.mp4')
+    ])
+    if not mp4_files:
+        print(f"  [ZIP] Khong co file MP4 nao trong '{label_dir}'")
+        return None
+
+    # Xác định nơi lưu zip
+    if zip_dir is None:
+        zip_dir = os.path.dirname(label_dir)
+    os.makedirs(zip_dir, exist_ok=True)
+
+    # Kiểm tra đã có ZIP của nhãn này chưa → nếu có thì bỏ qua
+    existing_zips = [
+        f for f in os.listdir(zip_dir)
+        if f.startswith(f"{label_name}_") and f.endswith('.zip')
+    ]
+    if existing_zips:
+        existing_zips.sort()
+        print(f"  [ZIP] Da ton tai {len(existing_zips)} file ZIP cho '{label_name}':")
+        for z in existing_zips:
+            sz = os.path.getsize(os.path.join(zip_dir, z)) / (1024*1024)
+            print(f"    - {z}  ({sz:.1f} MB)")
+        print(f"  [ZIP] Bo qua, khong tao lai.")
+        return os.path.join(zip_dir, existing_zips[-1])  # trả về file mới nhất
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    zip_name  = f"{label_name}_{timestamp}.zip"
+    zip_path  = os.path.join(zip_dir, zip_name)
+
+    print(f"\n  [ZIP] Dang gop {len(mp4_files)} file MP4 → '{zip_name}' ...")
+
+    added_files   = 0
+    added_jsons   = 0
+    total_size_mb = 0.0
+
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for fname in mp4_files:
+            fpath = os.path.join(label_dir, fname)
+            # Lưu trong zip theo cấu trúc: label_name/video.mp4
+            arcname = os.path.join(label_name, fname)
+            zf.write(fpath, arcname)
+            total_size_mb += os.path.getsize(fpath) / (1024 * 1024)
+            added_files += 1
+
+            # Đóng gói .json emotion nếu có
+            if include_json:
+                json_path = os.path.splitext(fpath)[0] + ".json"
+                if os.path.exists(json_path):
+                    zf.write(json_path, os.path.join(label_name,
+                             os.path.basename(json_path)))
+                    added_jsons += 1
+
+        # Thêm file manifest.json tóm tắt nội dung ZIP
+        manifest = {
+            'label':        label_name,
+            'num_videos':   added_files,
+            'num_emotions': added_jsons,
+            'created_at':   datetime.now().isoformat(),
+            'files':        mp4_files,
+        }
+        zf.writestr(
+            os.path.join(label_name, '_manifest.json'),
+            json.dumps(manifest, indent=2, ensure_ascii=False)
+        )
+
+    zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+    print(f"  [ZIP] Xong! {added_files} MP4 + {added_jsons} JSON")
+    print(f"  [ZIP] Kich thuoc goc: {total_size_mb:.1f} MB  →  ZIP: {zip_size_mb:.1f} MB")
+    print(f"  [ZIP] Da luu: {zip_path}")
+    return zip_path
+
+
+def upload_zip_to_hf(zip_path: str, label_name: str,
+                     split: str = "train",
+                     repo_id: str = None) -> bool:
+    """
+    Upload 1 file ZIP lên HuggingFace dataset.
+
+    File ZIP sẽ được đặt tại:
+        {repo_id}/data/{split}/zips/{label_name}/{basename}.zip
+
+    Args:
+        zip_path   : Đường dẫn file ZIP cục bộ
+        label_name : Tên nhãn (dùng để đặt đường dẫn trên HF)
+        split      : 'train' | 'val' | 'test'
+        repo_id    : HuggingFace repo ID (mặc định: lấy từ cấu hình collector)
+
+    Returns:
+        True nếu upload/queue thành công, False nếu thất bại.
+    """
+    if not os.path.exists(zip_path):
+        print(f"  [HF-ZIP] File khong ton tai: {zip_path}")
+        return False
+
+    zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+    print(f"\n  [HF-ZIP] Chuan bi upload: {os.path.basename(zip_path)}"
+          f"  ({zip_size_mb:.1f} MB)  →  split={split}")
+
+    try:
+        # Thử dùng huggingface_hub trực tiếp nếu upload_to_hf không hỗ trợ zip
+        from huggingface_hub import HfApi
+        import collector.hf_upload as hf_mod
+
+        _repo_id = repo_id or getattr(hf_mod, 'HF_REPO_ID', None)
+        if not _repo_id:
+            print("  [HF-ZIP] Chua cau hinh HF_REPO_ID!")
+            return False
+
+        api = HfApi()
+        # Đường dẫn trong repo: data/{split}/zips/{label_name}/xxx.zip
+        path_in_repo = (f"data/{split}/zips/{label_name}/"
+                        f"{os.path.basename(zip_path)}")
+
+        print(f"  [HF-ZIP] Dang upload len: {_repo_id}/{path_in_repo}")
+        api.upload_file(
+            path_or_fileobj=zip_path,
+            path_in_repo=path_in_repo,
+            repo_id=_repo_id,
+            repo_type="dataset",
+            commit_message=f"Add zip: {label_name}/{os.path.basename(zip_path)}",
+        )
+        print(f"  [HF-ZIP] Upload thanh cong!")
+        return True
+
+    except ImportError:
+        # Fallback: dùng upload_to_hf bình thường (queue-based)
+        print("  [HF-ZIP] Dung fallback queue-based upload ...")
+        result = upload_to_hf(zip_path, label_name, split=split)
+        if result:
+            _do_flush(f"Add zip {label_name}/{os.path.basename(zip_path)}")
+        return bool(result)
+
+    except Exception as e:
+        print(f"  [HF-ZIP] Loi upload: {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════════
 # LỚP CHÍNH
 # ══════════════════════════════════════════════════════════
 
 class WebcamVideoCollector:
 
     COUNTDOWN_SECS          = 1.5
-    RELAXED_FRAMES_TO_STOP  = 15    # ~0.5s @ 30fps — tay thả lỏng → dừng
+    RELAXED_FRAMES_TO_STOP  = 15
     COOLDOWN_SECS           = 2.0
-    MISSING_FRAMES_TO_STOP  = 5     # frames liên tiếp thiếu bộ phận → dừng ngay
-    DEFAULT_MAX_DURATION    = 10    # giây, 0 = không giới hạn
+    MISSING_FRAMES_TO_STOP  = 5
+    DEFAULT_MAX_DURATION    = 10
 
     def __init__(self, output_dir='data/videos'):
         self.output_dir    = output_dir
@@ -251,14 +416,13 @@ class WebcamVideoCollector:
                                 if result.pose_landmarks else None)
 
     def _on_hand(self, result, image, ts):
-        """FIX: Thêm kiểm tra an toàn cho handedness index"""
         left = right = None
         if result.hand_landmarks and result.handedness:
             for i, hlms in enumerate(result.hand_landmarks):
                 if i < len(result.handedness) and len(result.handedness[i]) > 0:
                     cat = result.handedness[i][0].category_name
                     if cat == 'Left':
-                        right = hlms  # Mirror flip
+                        right = hlms
                     else:
                         left = hlms
         self._latest['hands'] = (left, right)
@@ -440,7 +604,6 @@ class WebcamVideoCollector:
     def _draw_recording(self, frame, w, h, elapsed, frame_count, relaxed_cnt,
                          max_duration=0, missing_cnt=0, skipped=0, is_manual=False,
                          emotion=None):
-        """Thêm hiển thị emotion đang ghi."""
         if max_duration > 0 and not is_manual:
             remaining  = max(0.0, max_duration - elapsed)
             timer_txt  = f"REC {elapsed:.1f}s / {max_duration}s  |  {frame_count}f"
@@ -456,19 +619,14 @@ class WebcamVideoCollector:
         cv2.putText(frame, timer_txt,
                     (w//2-140, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, timer_color, 2)
 
-        # Nhấp nháy chấm đỏ
         if int(elapsed*2) % 2 == 0:
             cv2.circle(frame, (w//2-165, 20), 8, (0,0,255), -1)
 
-        # Hiển thị emotion đang ghi
         if emotion:
             emo_color = {
-                'happy': (0, 220, 120),
-                'angry': (0, 60, 255),
-                'sad':   (200, 100, 50),
-                'neutral': (180, 180, 180),
-                'surprise': (0, 200, 255),
-                'fear': (80, 0, 200),
+                'happy': (0, 220, 120), 'angry': (0, 60, 255),
+                'sad':   (200, 100, 50), 'neutral': (180, 180, 180),
+                'surprise': (0, 200, 255), 'fear': (80, 0, 200),
                 'disgust': (50, 180, 80),
             }.get(emotion, (200, 200, 200))
             cv2.putText(frame, f"EMO: {emotion.upper()}",
@@ -550,13 +708,6 @@ class WebcamVideoCollector:
 
     def collect_label(self, label_name: str, rec_config: dict = None,
                       default_emotion: str = None):
-        """
-        rec_config = {
-            'max_duration' : int  — giây tối đa, 0 = không giới hạn
-            'missing_limit': int  — frames thiếu bộ phận liên tiếp → dừng ngay
-        }
-        default_emotion : str hoặc None — emotion mặc định cho tất cả video của nhãn này
-        """
         if rec_config is None:
             rec_config = {
                 'max_duration':  self.DEFAULT_MAX_DURATION,
@@ -565,7 +716,7 @@ class WebcamVideoCollector:
         max_duration  = rec_config.get('max_duration',  self.DEFAULT_MAX_DURATION)
         missing_limit = rec_config.get('missing_limit', self.MISSING_FRAMES_TO_STOP)
 
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(1)
         if not cap.isOpened():
             print("  Khong the mo webcam!")
             return
@@ -594,7 +745,7 @@ class WebcamVideoCollector:
         show_mesh           = True
         auto_mode           = True
         is_manual_recording = False
-        current_emotion     = default_emotion  # emotion cho video đang ghi
+        current_emotion     = default_emotion
 
         emo_display = default_emotion if default_emotion else "chua chon"
         dur_display = f"{max_duration}s" if max_duration > 0 else "inf"
@@ -656,8 +807,6 @@ class WebcamVideoCollector:
 
             relaxed = self._hands_relaxed(pose_lms, left_h, right_h)
 
-            # ── Auto Mode State Machine ──────────────────
-
             if auto_mode:
                 if state == 'idle':
                     in_cooldown = (now - last_stop_time) < self.COOLDOWN_SECS
@@ -681,8 +830,6 @@ class WebcamVideoCollector:
                     elif not framing['ok'] or relaxed:
                         state = 'idle'
                         print("  Auto: Huy dem nguoc")
-
-            # ── Recording Logic ──────────────────────────
 
             if state == 'recording':
                 elapsed = now - start_time
@@ -727,15 +874,12 @@ class WebcamVideoCollector:
                 video_writer.write(clean_frame)
                 frame_count += 1
 
-            # ── Header ──────────────────────────────────
-
             cv2.rectangle(frame, (0,0), (w,55), (30,30,30), -1)
             cv2.putText(frame, f"Nhan: {label_name.upper()}", (10,25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
             cv2.putText(frame, f"Video: {video_count}", (10,48),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
 
-            # Hiển thị emotion mặc định ở header
             emo_hdr = default_emotion if default_emotion else "none"
             cv2.putText(frame, f"Emo:{emo_hdr}",
                         (w-330, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150,220,255), 1)
@@ -795,7 +939,6 @@ class WebcamVideoCollector:
 
             if key == ord(' '):
                 if state != 'recording':
-                    # Đặt emotion trước khi ghi nếu chưa có
                     if default_emotion is None:
                         print("\n  [!] Chua co emotion! Chon emotion cho video nay:")
                         chosen = ask_emotion()
@@ -824,7 +967,6 @@ class WebcamVideoCollector:
                     is_manual_recording = False
 
             elif key in (ord('e'), ord('E')):
-                # Đổi emotion mặc định ngay trong lúc quay
                 if state != 'recording':
                     print("\n  Doi emotion mac dinh:")
                     new_emo = ask_emotion(default=default_emotion)
@@ -845,7 +987,6 @@ class WebcamVideoCollector:
             elif key in (ord('q'), ord('Q')):
                 if state == 'recording' and video_writer:
                     video_writer.release()
-                    # Lưu emotion cho video vừa ghi dở
                     if current_emotion and fp:
                         save_video_emotion(fp, current_emotion)
                     video_count += 1
@@ -887,14 +1028,11 @@ class WebcamVideoCollector:
     def _stop_recording(self, video_writer, video_count,
                          frame_count, duration, fp, label_name, now,
                          emotion=None):
-        """Dừng ghi, lưu emotion vào .json cạnh video, rồi flush lên HF."""
         video_writer.release()
         video_count += 1
         print(f"  DUNG video {video_count} ({frame_count}f, {duration:.1f}s)  [emotion={emotion or 'none'}]")
-        # Lưu emotion
         if emotion and fp:
             save_video_emotion(fp, emotion)
-        # Queue lên HF rồi flush ngay (commit 1 file 1 lần)
         upload_to_hf(fp, label_name, split="train")
         _do_flush(f"Add {label_name}/{os.path.basename(fp)}")
         return video_count, now
@@ -914,10 +1052,11 @@ class WebcamVideoCollector:
             print("  4. Thu video IDLE (nghi / khong ky hieu)")
             print("  5. Upload video co san len HuggingFace")
             print("  6. Gan emotion cho video co san")
-            print("  7. Luu va thoat")
+            print("  7. Gop video thanh ZIP va upload len HuggingFace   ← MOI")
+            print("  8. Luu va thoat")
             print("="*60)
 
-            ch = input("\n  Chon (1-7): ").strip()
+            ch = input("\n  Chon (1-8): ").strip()
 
             if ch == "1":
                 self.show_statistics()
@@ -932,7 +1071,6 @@ class WebcamVideoCollector:
                     if input(f"  '{lb}' da ton tai! Thu them? (y/n): ").strip().lower() != 'y':
                         continue
 
-                # ── Chọn emotion mặc định cho nhãn này ──
                 print(f"\n  Chon emotion mac dinh cho tat ca video cua nhan '{lb}':")
                 default_emo = ask_emotion(default='neutral')
 
@@ -955,7 +1093,6 @@ class WebcamVideoCollector:
                         chosen_lb  = labels[idx]
                         saved_emo  = self.metadata['labels'][chosen_lb].get('default_emotion') or None
 
-                        # Hỏi có muốn đổi emotion không
                         print(f"\n  Emotion hien tai cua '{chosen_lb}': {saved_emo or 'chua co'}")
                         ans = input("  Doi emotion? (y/n, mac dinh n): ").strip().lower()
                         if ans == 'y':
@@ -980,6 +1117,9 @@ class WebcamVideoCollector:
                 self._menu_assign_existing_emotions()
 
             elif ch == "7":
+                self._menu_zip_and_upload()          # ← MỚI
+
+            elif ch == "8":
                 self._save_meta()
                 self.show_statistics()
                 self._ask_organize_on_exit()
@@ -989,19 +1129,192 @@ class WebcamVideoCollector:
                 print("  Khong hop le!")
 
     # ══════════════════════════════════════════════════════
+    # MENU 7: GỘP VIDEO THÀNH ZIP VÀ UPLOAD  (v5 - MỚI)
+    # ══════════════════════════════════════════════════════
+
+    def _menu_zip_and_upload(self):
+        """
+        Menu chính cho chức năng ZIP:
+          - Chọn 1 nhãn hoặc tất cả nhãn
+          - Xem preview số file trước khi tạo zip
+          - Chọn thư mục lưu zip
+          - Tùy chọn upload zip lên HuggingFace ngay sau khi tạo
+          - Tùy chọn giữ hoặc xóa file zip sau khi upload
+        """
+        print("\n" + "="*60)
+        print(" GOP VIDEO THANH ZIP + UPLOAD HUGGINGFACE ".center(60))
+        print("="*60)
+
+        # ── Quét các nhãn có video ──────────────────────
+        available = []
+        skip_dirs = {'train', 'val', 'test'}
+        for lb in sorted(os.listdir(self.output_dir)):
+            lp = os.path.join(self.output_dir, lb)
+            if not os.path.isdir(lp) or lb in skip_dirs:
+                continue
+            mp4s = [f for f in os.listdir(lp) if f.endswith('.mp4')]
+            if mp4s:
+                available.append((lb, lp, len(mp4s)))
+
+        if not available:
+            print("\n  Khong co nhan nao co video!")
+            input("  ENTER de quay lai..."); return
+
+        # ── Hiển thị danh sách nhãn ─────────────────────
+        print(f"\n  {'#':<5} {'Nhan':<30} {'So MP4':<10} {'Tong kich thuoc'}")
+        print("  " + "-"*60)
+        for i, (lb, lp, n) in enumerate(available, 1):
+            total_mb = sum(
+                os.path.getsize(os.path.join(lp, f)) / (1024*1024)
+                for f in os.listdir(lp) if f.endswith('.mp4')
+            )
+            print(f"  {i:<5} {lb:<30} {n:<10} {total_mb:.1f} MB")
+        print("  " + "-"*60)
+        print("   0. Gop tat ca nhan")
+        print()
+
+        raw = input("  Chon nhan (0 / so / nhieu so cach boi dau phay): ").strip()
+
+        # Xác định danh sách nhãn cần gộp
+        if raw == "0":
+            chosen = available
+        else:
+            chosen = []
+            for tok in raw.split(","):
+                tok = tok.strip()
+                if tok.isdigit():
+                    idx = int(tok) - 1
+                    if 0 <= idx < len(available):
+                        chosen.append(available[idx])
+                    else:
+                        print(f"  Bỏ qua số ngoài phạm vi: {tok}")
+                else:
+                    # Cho phép nhập tên nhãn trực tiếp
+                    match = [(lb, lp, n) for lb, lp, n in available if lb == tok]
+                    chosen.extend(match)
+
+        if not chosen:
+            print("  Khong chon duoc nhan nao!"); return
+
+        # ── Tóm tắt trước khi zip ───────────────────────
+        total_videos = sum(n for _, _, n in chosen)
+        print(f"\n  Se gop {len(chosen)} nhan, tong {total_videos} video:")
+        for lb, _, n in chosen:
+            print(f"    - {lb}: {n} video")
+
+        # ── Thư mục lưu zip ─────────────────────────────
+        default_zip_dir = os.path.join(os.path.dirname(self.output_dir), 'zips')
+        print(f"\n  Thu muc luu ZIP (mac dinh: {default_zip_dir})")
+        zip_dir_input = input("  Nhap duong dan hoac Enter de dung mac dinh: ").strip()
+        zip_dir = zip_dir_input if zip_dir_input else default_zip_dir
+        os.makedirs(zip_dir, exist_ok=True)
+        print(f"  → Luu ZIP vao: {zip_dir}")
+
+        # ── Có bao gồm .json emotion không ─────────────
+        inc_json_ans = input("\n  Kem theo file .json emotion? (y/n, mac dinh y): ").strip().lower()
+        include_json = (inc_json_ans != 'n')
+
+        # ── Xác nhận ────────────────────────────────────
+        print(f"\n  Xac nhan:")
+        print(f"    Nhan     : {', '.join(lb for lb, _, _ in chosen)}")
+        print(f"    Luu vao  : {zip_dir}")
+        print(f"    Kem JSON : {'Co' if include_json else 'Khong'}")
+        if input("\n  Bat dau gop? (y/n): ").strip().lower() != 'y':
+            print("  Da huy."); return
+
+
+        # ── Kiểm tra trùng ZIP trước khi tạo ────────────
+        skip_labels = []
+        for lb, lp, _ in chosen:
+            existing = sorted([
+                f for f in os.listdir(zip_dir)
+                if f.startswith(f"{lb}_") and f.endswith('.zip')
+            ])
+            if existing:
+                sz = os.path.getsize(os.path.join(zip_dir, existing[-1])) / (1024*1024)
+                print(f"  [SKIP] '{lb}' da co ZIP: {existing[-1]}  ({sz:.1f} MB)")
+                skip_labels.append(lb)
+
+        chosen = [(lb, lp, n) for lb, lp, n in chosen if lb not in skip_labels]
+
+        if not chosen:
+            print("\n  Tat ca nhan da co ZIP, khong can tao lai!")
+            input("  ENTER de quay lai..."); return
+
+        if skip_labels:
+            print(f"  → Se chi gop {len(chosen)} nhan con lai.\n")
+
+        # ── Tạo ZIP cho từng nhãn ───────────────────────
+        created_zips = []   # list of (zip_path, label_name)
+        for lb, lp, _ in chosen:
+            zp = zip_label_videos(lp, lb, zip_dir=zip_dir, include_json=include_json)
+            if zp:
+                created_zips.append((zp, lb))
+
+        if not created_zips:
+            print("\n  Khong tao duoc file ZIP nao!")
+            input("  ENTER de quay lai..."); return
+
+        print(f"\n  Da tao {len(created_zips)} file ZIP:")
+        for zp, lb in created_zips:
+            sz = os.path.getsize(zp) / (1024*1024)
+            print(f"    {os.path.basename(zp)}  ({sz:.1f} MB)  ← {lb}")
+
+        # ── Hỏi upload lên HuggingFace không ────────────
+        if input("\n  Upload ZIP len HuggingFace? (y/n): ").strip().lower() != 'y':
+            print(f"\n  Cac file ZIP da duoc luu tai: {zip_dir}")
+            input("  ENTER de quay lai..."); return
+
+        # Chọn split
+        print("\n  Upload vao split nao?")
+        print("  [1] train  [2] val  [3] test")
+        sp_ch = input("  Chon (mac dinh: train): ").strip()
+        split = {'1': 'train', '2': 'val', '3': 'test'}.get(sp_ch, 'train')
+        print(f"  → split: {split}")
+
+        # ── Upload từng file ZIP ─────────────────────────
+        upload_ok  = []
+        upload_fail = []
+        for i, (zp, lb) in enumerate(created_zips, 1):
+            print(f"\n  [{i}/{len(created_zips)}] Upload '{os.path.basename(zp)}' ...")
+            ok = upload_zip_to_hf(zp, lb, split=split)
+            if ok:
+                upload_ok.append((zp, lb))
+            else:
+                upload_fail.append((zp, lb))
+
+        # ── Tóm tắt kết quả ─────────────────────────────
+        print(f"\n  KET QUA UPLOAD:")
+        print(f"    Thanh cong : {len(upload_ok)}/{len(created_zips)} file")
+        if upload_fail:
+            print(f"    That bai   : {len(upload_fail)} file")
+            for zp, lb in upload_fail:
+                print(f"      - {os.path.basename(zp)}")
+
+        # ── Hỏi có xóa file zip cục bộ sau upload không ─
+        if upload_ok:
+            del_ans = input("\n  Xoa file ZIP cuc bo sau khi upload? (y/n, mac dinh n): ").strip().lower()
+            if del_ans == 'y':
+                for zp, _ in upload_ok:
+                    try:
+                        os.remove(zp)
+                        print(f"  Da xoa: {os.path.basename(zp)}")
+                    except Exception as e:
+                        print(f"  Loi xoa {os.path.basename(zp)}: {e}")
+            else:
+                print(f"  Giu lai tai: {zip_dir}")
+
+        input("\n  ENTER de quay lai menu...")
+
+    # ══════════════════════════════════════════════════════
     # MENU: GÁN EMOTION CHO VIDEO CÓ SẴN
     # ══════════════════════════════════════════════════════
 
     def _menu_assign_existing_emotions(self):
-        """
-        Quét tất cả video trong output_dir, tìm video chưa có emotion,
-        cho phép người dùng gán thủ công hoặc hàng loạt.
-        """
         print("\n" + "="*60)
         print(" GAN EMOTION CHO VIDEO CO SAN ".center(60))
         print("="*60)
 
-        # Thu thập danh sách video theo label
         label_videos = {}
         for lb_name in sorted(os.listdir(self.output_dir)):
             lb_path = os.path.join(self.output_dir, lb_name)
@@ -1024,14 +1337,13 @@ class WebcamVideoCollector:
         if not label_videos:
             print("\n  Khong tim thay video nao!"); return
 
-        # Hiển thị tổng quan
         total_missing = sum(len(v['missing']) for v in label_videos.values())
         print(f"\n  {'Nhan':<30} {'Co emotion':<15} {'Thieu emotion'}")
         print("  " + "-"*55)
         for lb, data in label_videos.items():
             ok  = len(data['assigned'])
             mis = len(data['missing'])
-            status = f"⚠️  {mis}" if mis > 0 else "✅"
+            status = f"!  {mis}" if mis > 0 else "OK"
             print(f"  {lb:<30} {ok:<15} {status}")
         print("  " + "-"*55)
         print(f"  Tong thieu: {total_missing} video\n")
@@ -1063,7 +1375,7 @@ class WebcamVideoCollector:
                     if emo:
                         for vp in data['missing']:
                             save_video_emotion(vp, emo)
-                            print(f"    ✓ {os.path.basename(vp)} → {emo}")
+                            print(f"    + {os.path.basename(vp)} → {emo}")
                         print(f"  Xong! {len(data['missing'])} video da duoc gan '{emo}'")
                 else:
                     print("  Khong hop le!")
@@ -1140,7 +1452,6 @@ class WebcamVideoCollector:
             choice  = input("\n  Chon (0 / 1-12 / 99): ").strip()
             rec_cfg = self._ask_rec_config()
 
-            # Idle thường dùng emotion neutral
             print("\n  Emotion cho video IDLE (thuong la neutral):")
             idle_emo = ask_emotion(default='neutral')
 
@@ -1171,8 +1482,6 @@ class WebcamVideoCollector:
 
     # ══════════════════════════════════════════════════════
     # MENU: UPLOAD FILE MP4
-    # Cải tiến: chọn file tùy ý, xem preview, lọc theo nhãn,
-    # gán emotion trước khi upload
     # ══════════════════════════════════════════════════════
 
     def _pick_files_gui(self) -> list:
@@ -1203,14 +1512,12 @@ class WebcamVideoCollector:
             return ""
 
     def _scan_videos_in_path(self, path: str) -> list:
-        """Quét video từ file hoặc thư mục."""
         exts  = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
         found = []
         if os.path.isfile(path):
             if os.path.splitext(path)[1].lower() in exts:
                 found.append(path)
         elif os.path.isdir(path):
-            # Quét đệ quy 1 cấp
             for f in sorted(os.listdir(path)):
                 fp = os.path.join(path, f)
                 if os.path.isfile(fp) and os.path.splitext(f)[1].lower() in exts:
@@ -1218,13 +1525,11 @@ class WebcamVideoCollector:
         return found
 
     def _preview_files(self, files: list):
-        """Hiển thị danh sách file sẽ upload."""
         print(f"\n  {'#':<5} {'File':<50} {'Emotion'}")
         print("  " + "-"*70)
         for i, fp in enumerate(files, 1):
             emo = get_video_emotion(fp) or "(chua co)"
             fname = os.path.basename(fp)
-            # Rút gọn nếu quá dài
             if len(fname) > 45:
                 fname = "..." + fname[-42:]
             print(f"  {i:<5} {fname:<50} {emo}")
@@ -1276,7 +1581,6 @@ class WebcamVideoCollector:
                     print(f"    Khong tim thay: {p}")
 
         elif ch == "4":
-            # Liệt kê các label trong output_dir
             labels_dirs = []
             for lb in sorted(os.listdir(self.output_dir)):
                 lp = os.path.join(self.output_dir, lb)
@@ -1316,13 +1620,11 @@ class WebcamVideoCollector:
         if not selected_files:
             input("  Khong co file. ENTER de quay lai..."); return
 
-        # ── Preview danh sách file ──
         self._preview_files(selected_files)
 
-        # ── Kiểm tra file thiếu emotion ──
         files_no_emo = [f for f in selected_files if not get_video_emotion(f)]
         if files_no_emo:
-            print(f"  ⚠️  {len(files_no_emo)}/{len(selected_files)} file chua co emotion!")
+            print(f"  ! {len(files_no_emo)}/{len(selected_files)} file chua co emotion!")
             print("  [1] Gan cung 1 emotion cho tat ca file thieu")
             print("  [2] Bo qua (upload khong co emotion)")
             sub = input("  Chon: ").strip()
@@ -1333,7 +1635,6 @@ class WebcamVideoCollector:
                         save_video_emotion(fp, emo)
                     print(f"  Da gan '{emo}' cho {len(files_no_emo)} file")
 
-        # ── Lọc / xác nhận ──
         print(f"\n  Xac nhan upload {len(selected_files)} file?")
         confirm = input("  (y=upload / n=huy / f=loc bot): ").strip().lower()
         if confirm == 'n':
@@ -1354,7 +1655,6 @@ class WebcamVideoCollector:
             if not selected_files:
                 print("  Danh sach rong, huy upload."); return
 
-        # ── Chọn label ──
         if self.metadata['labels']:
             labels_exist = list(self.metadata['labels'].keys())
             print("\n  Label hien co:")
@@ -1372,7 +1672,6 @@ class WebcamVideoCollector:
         if not label_name:
             print("  Ten rong! Huy."); return
 
-        # ── Chọn split ──
         print("\n  Upload vao split nao?")
         print("  [1] train  [2] val  [3] test")
         sp_ch = input("  Chon (mac dinh: train): ").strip()
@@ -1382,7 +1681,6 @@ class WebcamVideoCollector:
         label_dir = os.path.join(self.output_dir, label_name)
         os.makedirs(label_dir, exist_ok=True)
 
-        # ── Upload ──
         success = 0
         failed  = []
         print(f"\n  Dang queue {len(selected_files)} file...")
@@ -1392,7 +1690,6 @@ class WebcamVideoCollector:
             if os.path.abspath(fp) != os.path.abspath(local_target):
                 import shutil
                 shutil.copy2(fp, local_target)
-                # Copy cả .json emotion nếu có
                 src_json = os.path.splitext(fp)[0] + ".json"
                 dst_json = os.path.splitext(local_target)[0] + ".json"
                 if os.path.exists(src_json):
@@ -1404,7 +1701,6 @@ class WebcamVideoCollector:
             if queued:
                 success += 1
 
-        # ── Flush tất cả 1 lần (1 commit duy nhất) ──
         if success > 0:
             print(f"\n  Dang commit {success} file len HuggingFace (split={split})...")
             _do_flush(f"Upload {success} videos for {label_name} ({split})")
