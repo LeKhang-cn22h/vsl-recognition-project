@@ -11,10 +11,9 @@ Cau truc local:
     D:/NCKhoc/vsl-recognition-project/data/processed/val/<label>/*.npy
     D:/NCKhoc/vsl-recognition-project/data/processed/test/<label>/*.npy
 
-Cau truc tren HF (giu nguyen):
-    processed/train/<label>/*.npy
-    processed/val/<label>/*.npy
-    processed/test/<label>/*.npy
+Cau truc tren HF:
+  folder mode: processed/train/<label>/*.npy
+  zip    mode: processed_zip/train/<label>.zip  (moi zip chua tat ca .npy cua 1 label)
 
 Chay:
   python upload_npy.py                        # upload tat ca (skip da co)
@@ -23,6 +22,7 @@ Chay:
   python upload_npy.py --label ai lo_so       # chi 2 labels
   python upload_npy.py --dry-run              # preview khong upload
   python upload_npy.py --mode bulk            # 1 commit toan bo (upload_folder)
+  python upload_npy.py --mode zip             # nen tung label thanh .zip roi upload
   python upload_npy.py --reset-tracking       # xoa cache -> upload lai tat ca
   python upload_npy.py --stats                # xem thong ke tracking
 """
@@ -32,6 +32,9 @@ import sys
 import json
 import hashlib
 import argparse
+import zipfile
+import tempfile
+import shutil
 from pathlib import Path
 from datetime import datetime
 
@@ -56,6 +59,7 @@ except ImportError:
 LOCAL_DIR     = r"D:\NCKhoc\vsl-recognition-project\data\processed"
 TRACKING_FILE = r"D:\NCKhoc\vsl-recognition-project\.hf_uploaded_npy.json"
 SPLITS        = ["train", "val", "test"]
+ZIP_TEMP_DIR  = r"D:\NCKhoc\vsl-recognition-project\data\processed_zip"  # thu muc chua zip tam
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -338,6 +342,154 @@ def print_scan_table(scan_data):
     print(f"  {'TOTAL':<34} {total:>7}\n")
 
 
+
+# ══════════════════════════════════════════════════════════════════
+# ZIP MODE
+# ══════════════════════════════════════════════════════════════════
+
+def zip_label_folder(label_dir: str, label_name: str, split: str,
+                     zip_dir: str) -> str:
+    """
+    Nen toan bo .npy trong label_dir thanh 1 file zip.
+    Ten zip: <split>__<label_name>.zip
+    Luu vao zip_dir/<split>/
+    Returns duong dan file zip da tao.
+    """
+    out_dir  = os.path.join(zip_dir, split)
+    os.makedirs(out_dir, exist_ok=True)
+    zip_name = f"{split}__{label_name}.zip"
+    zip_path = os.path.join(out_dir, zip_name)
+
+    npy_files = sorted([f for f in os.listdir(label_dir) if f.endswith('.npy')])
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for fname in npy_files:
+            fpath = os.path.join(label_dir, fname)
+            # Giu cau truc: <label_name>/<filename>.npy ben trong zip
+            zf.write(fpath, arcname=os.path.join(label_name, fname))
+
+    size_mb = os.path.getsize(zip_path) / 1024 / 1024
+    return zip_path, len(npy_files), size_mb
+
+
+def run_zip_upload(uploader, scan_data, zip_dir: str, dry_run: bool):
+    """
+    Mode ZIP:
+      1. Nen tung label -> <split>__<label>.zip
+      2. Queue tat ca zip -> flush 1 commit duy nhat
+
+    Cau truc tren HF:
+      processed_zip/train/<split>__<label>.zip
+      processed_zip/val/<split>__<label>.zip
+      processed_zip/test/<split>__<label>.zip
+
+    Giai nen khi dung:
+      import zipfile, numpy as np, io
+      with zipfile.ZipFile("train__ai.zip") as zf:
+          data = np.load(io.BytesIO(zf.read("ai/ai_0000_org.npy")))
+    """
+    summary    = []
+    zip_queue  = []   # [(zip_path, remote_path), ...]
+
+    print(f"  Zip dir: {zip_dir}")
+    print(f"  Dang nen va queue...")
+
+    for split, labels in scan_data.items():
+        if not labels:
+            continue
+        for label, info in labels.items():
+            label_dir = info['dir']
+            total_npy = info['count']
+
+            # Kiem tra xem zip da ton tai va khop hash chua
+            out_split_dir = os.path.join(zip_dir, split)
+            zip_name      = f"{split}__{label}.zip"
+            zip_path      = os.path.join(out_split_dir, zip_name)
+            remote_path   = f"processed_zip/{split}/{zip_name}"
+
+            # Check skip: dung tracking giong NPYUploader
+            if uploader._is_uploaded(zip_path):
+                size_mb = os.path.getsize(zip_path) / 1024 / 1024
+                print(f"  - [{split}/{label}]  skip (zip da upload: {size_mb:.1f} MB)")
+                summary.append({'split': split, 'label': label, 'total': total_npy,
+                                'zip': zip_name, 'size_mb': size_mb,
+                                'status': 'skipped'})
+                continue
+
+            if dry_run:
+                # Uoc tinh kich thuoc (khong nen that)
+                raw_mb = sum(
+                    os.path.getsize(os.path.join(label_dir, f))
+                    for f in os.listdir(label_dir) if f.endswith('.npy')
+                ) / 1024 / 1024
+                print(f"  + [{split}/{label}]  {total_npy} files  ~{raw_mb:.1f} MB raw  [DRY RUN]")
+                summary.append({'split': split, 'label': label, 'total': total_npy,
+                                'zip': zip_name, 'size_mb': raw_mb,
+                                'status': 'dry_run'})
+                continue
+
+            # Nen that
+            print(f"  + [{split}/{label}]  Dang nen {total_npy} files -> {zip_name} ...", end='', flush=True)
+            zip_path, n_files, size_mb = zip_label_folder(label_dir, label, split, zip_dir)
+            print(f"  {size_mb:.1f} MB")
+
+            zip_queue.append((zip_path, remote_path))
+            summary.append({'split': split, 'label': label, 'total': total_npy,
+                            'zip': zip_name, 'size_mb': size_mb,
+                            'zip_path': zip_path, 'remote': remote_path,
+                            'status': 'queued'})
+
+    # ── Upload tat ca zip -> 1 commit ────────────────────────────
+    total_queued = len(zip_queue)
+    total_skip   = sum(1 for r in summary if r['status'] == 'skipped')
+    total_size   = sum(r['size_mb'] for r in summary if r['status'] == 'queued')
+
+    print(f"\n  Queue: {total_queued} zip files  ({total_size:.1f} MB)  |  Skip: {total_skip}")
+
+    if total_queued > 0 and not dry_run:
+        # Dung NPYUploader.flush nhung inject zip vao queue truc tiep
+        uploader._queue = zip_queue
+        uploaded = uploader.flush(
+            commit_message=(f"Upload processed_zip/ ({total_queued} zip files) "
+                            f"{datetime.now():%Y-%m-%d %H:%M}"),
+            dry_run=False,
+        )
+        final_status = 'uploaded' if uploaded > 0 else 'error'
+        for r in summary:
+            if r['status'] == 'queued':
+                r['status'] = final_status
+
+    # ── Summary ───────────────────────────────────────────────────
+    icons = {'uploaded': 'OK', 'skipped': 'SKIP', 'dry_run': 'DRY', 'error': 'ERR', 'queued': '...'}
+    print(f"\n{'='*65}")
+    print("  TONG KET ZIP".center(65))
+    print(f"{'='*65}")
+    print(f"  {'Split':<8} {'Label':<22} {'Files':>6} {'Size MB':>8}  Status  Zip")
+    print(f"  {'-'*61}")
+
+    for r in summary:
+        icon = icons.get(r['status'], '???')
+        print(f"  {r['split']:<8} {r['label']:<22} {r['total']:>6} {r['size_mb']:>8.1f}"
+              f"  [{icon}]  {r['zip']}")
+
+    print(f"  {'-'*61}")
+    total_files = sum(r['total'] for r in summary)
+    total_mb    = sum(r['size_mb'] for r in summary)
+    print(f"  {len(summary)} labels  |  {total_files} npy files  |  {total_mb:.1f} MB total")
+
+    if dry_run:
+        print(f"\n  [DRY RUN] Chua nen / upload gi! Bo --dry-run de chay that.")
+        print(f"  Zip se luu vao: {zip_dir}")
+    elif total_queued == 0:
+        print(f"\n  Tat ca da upload roi - khong co gi moi!")
+    else:
+        print(f"\n  Hoan thanh! {total_queued} zip da upload (1 commit).")
+        print(f"  Xem: https://huggingface.co/datasets/{uploader.repo_id}/tree/main/processed_zip")
+        print(f"\n  Giai nen khi dung:")
+        print(f"    import zipfile, numpy as np, io")
+        print(f"    with zipfile.ZipFile(\'train__ai.zip\') as zf:")
+        print(f"        arr = np.load(io.BytesIO(zf.read(\'ai/ai_0000_org.npy\')))")
+    print(f"{'='*65}\n")
+
 # ══════════════════════════════════════════════════════════════════
 # MAIN UPLOAD LOOP
 # ══════════════════════════════════════════════════════════════════
@@ -427,6 +579,7 @@ Vi du:
   python upload_npy.py --label ai lo_so       # chi 2 labels
   python upload_npy.py --dry-run              # preview
   python upload_npy.py --mode bulk            # 1 commit toan bo
+  python upload_npy.py --mode zip             # nen label -> zip -> upload
   python upload_npy.py --reset-tracking       # upload lai tat ca
   python upload_npy.py --stats                # xem thong ke
         """
@@ -436,8 +589,10 @@ Vi du:
                         choices=SPLITS)
     parser.add_argument('--label',          nargs='+', default=None)
     parser.add_argument('--mode',           default='folder',
-                        choices=['folder', 'bulk'],
-                        help='folder=1 commit/label | bulk=1 commit toan bo')
+                        choices=['folder', 'bulk', 'zip'],
+                        help='folder=1 commit/label | bulk=1 commit toan bo | zip=nen tung label roi upload')
+    parser.add_argument('--zip-dir',        default=ZIP_TEMP_DIR,
+                        help='Thu muc luu file zip tam (chi dung voi --mode zip)')
     parser.add_argument('--dry-run',        action='store_true')
     parser.add_argument('--reset-tracking', action='store_true')
     parser.add_argument('--stats',          action='store_true')
@@ -495,6 +650,9 @@ Vi du:
     # Upload
     if args.mode == 'bulk':
         uploader.upload_bulk(args.local_dir, dry_run=args.dry_run)
+    elif args.mode == 'zip':
+        run_zip_upload(uploader, scan_data,
+                       zip_dir=args.zip_dir, dry_run=args.dry_run)
     else:
         run_upload(uploader, scan_data, dry_run=args.dry_run)
 
