@@ -72,7 +72,7 @@ def organize():
 
     labels = scan_labels(LABEL_SRC_DIR)
     if not labels:
-        print(f"\n❌ Không tìm thấy label nào trong {LABEL_SRC_DIR}"); return
+        print(f"\n Không tìm thấy label nào trong {LABEL_SRC_DIR}"); return
 
     ok, warn = {}, {}
     for lb, vids in labels.items():
