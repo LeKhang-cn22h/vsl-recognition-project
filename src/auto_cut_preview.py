@@ -159,10 +159,47 @@ def _wrist_min_y(pose, hands):
     return min(ys) if ys else None
 
 
+def _finger_curl_active(hands, curl_thresh=0.15):
+    """
+    Kiem tra ban tay co dang lam ky hieu (ngon co/gap) hay thua long.
+    - Tinh goc gap tại moi khop PIP cua 4 ngon tay (tro den ut).
+    - Nếu trung binh curl > curl_thresh -> dang cu dong.
+    Tra ve True neu it nhat 1 ban tay dang cu dong.
+    """
+    if not hands:
+        return False
+    FINGERS = [(5, 6, 8), (9, 10, 12), (13, 14, 16), (17, 18, 20)]
+    for hand in hands:
+        curls = []
+        for mcp_i, pip_i, tip_i in FINGERS:
+            mcp = np.array([hand[mcp_i].x, hand[mcp_i].y])
+            pip = np.array([hand[pip_i].x, hand[pip_i].y])
+            tip = np.array([hand[tip_i].x, hand[tip_i].y])
+            v1 = pip - mcp
+            v2 = tip - pip
+            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+            if n1 < 1e-6 or n2 < 1e-6:
+                curls.append(0.0)
+                continue
+            cos_a = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+            curls.append(1.0 - cos_a)  # 0=thang, 2=cong hoan toan
+        if float(np.mean(curls)) > curl_thresh:
+            return True
+    return False
+
+
 def analyze_frames(frames, fps,
                    padding_sec=0.25, min_dur=0.4, idle_sec=0.7,
                    shoulder_margin=0.03, smooth_w=7,
+                   use_margin=True, use_finger=False,
+                   finger_curl_thresh=0.15,
                    progress_cb=None):
+    """
+    use_margin : bat dieu kien tay phai cao hon vai (shoulder_margin)
+    use_finger : bat dieu kien ngon tay phai dang cu dong (khong thua long)
+    Neu ca 2 bat -> can THOA BOTH dieu kien moi tinh la 'dang ky hieu'
+    Neu ca 2 tat -> moi frame co tay la 'dang ky hieu' (phat hien tat ca)
+    """
     det = Detector(progress_cb)
     N   = len(frames)
     raw = np.zeros(N, dtype=np.float32)
@@ -171,9 +208,32 @@ def analyze_frames(frames, fps,
         if progress_cb and i % 15 == 0:
             progress_cb(f"Phan tich frame {i}/{N}  ({i*100//N}%)")
         pose, hands = det.detect(frame)
-        sy = _shoulder_y(pose)
-        wy = _wrist_min_y(pose, hands)
-        if sy is not None and wy is not None and wy < sy - shoulder_margin:
+
+        cond_margin = True
+        cond_finger = True
+
+        if use_margin:
+            sy = _shoulder_y(pose)
+            wy = _wrist_min_y(pose, hands)
+            cond_margin = (sy is not None and wy is not None
+                           and wy < sy - shoulder_margin)
+
+        if use_finger:
+            cond_finger = _finger_curl_active(hands, finger_curl_thresh)
+
+        # Neu bat ca 2: phai thoa ca hai
+        # Neu chi bat 1: thoa dieu kien do
+        # Neu tat ca 2: chi can co tay (hands detected)
+        if use_margin and use_finger:
+            active = cond_margin and cond_finger
+        elif use_margin:
+            active = cond_margin
+        elif use_finger:
+            active = cond_finger and bool(hands)
+        else:
+            active = bool(hands)  # fallback: co tay la du
+
+        if active:
             raw[i] = 1.0
 
     det.close()
@@ -427,6 +487,8 @@ class App:
         self._play_job  = None
 
         self._cfg_vars = {}
+        self._use_margin = tk.BooleanVar(value=True)   # bat mac dinh
+        self._use_finger = tk.BooleanVar(value=False)  # tat mac dinh
 
         root.title(f"VSL Auto Cut  —  {data_dir}")
         root.configure(bg=BG)
@@ -480,6 +542,45 @@ class App:
                     self.cfg.get("idle_sec", 0.7))
         _make_param(pr, "margin",     "margin",  0.0, 0.15, 0.01,
                     self.cfg.get("margin", 0.03))
+
+        # ── Toggle buttons: Margin + Finger ──────────────────────────
+        tg = tk.Frame(tb, bg=PANEL)
+        tg.pack(side=tk.RIGHT, padx=4)
+
+        def _make_toggle(parent, text_on, text_off, var, hint):
+            """Nut bat/tat doi mau khi click."""
+            btn_holder = [None]
+
+            def _toggle():
+                var.set(not var.get())
+                _refresh()
+
+            def _refresh():
+                on = var.get()
+                btn_holder[0].config(
+                    text=f"✔ {text_on}" if on else f"✗ {text_off}",
+                    bg=GRN if on else "#374151",
+                    fg="white")
+
+            btn = tk.Button(parent, text="", font=(MONO, 8, "bold"),
+                            relief=tk.FLAT, cursor="hand2",
+                            padx=8, pady=5, command=_toggle)
+            btn.pack(pady=2)
+            btn_holder[0] = btn
+            # Tooltip nho
+            tk.Label(parent, text=hint, bg=PANEL, fg=GRAY,
+                     font=(MONO, 6)).pack()
+            _refresh()
+            return btn
+
+        tk.Label(tg, text="Bo loc", bg=PANEL, fg=GR2,
+                 font=(MONO, 7, "bold")).pack()
+        _make_toggle(tg, "Margin tay>vai", "Margin OFF",
+                     self._use_margin,
+                     "tay phai cao hon vai")
+        _make_toggle(tg, "Finger curl", "Finger OFF",
+                     self._use_finger,
+                     "ngon tay dang co/ky hieu")
 
         pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL,
                               bg=BG, sashwidth=5, sashrelief=tk.FLAT)
@@ -710,11 +811,13 @@ class App:
 
                 clips = analyze_frames(
                     frames, fps,
-                    padding_sec     = self._cfg_vars["padding"].get(),
-                    min_dur         = self._cfg_vars["min_dur"].get(),
-                    idle_sec        = self._cfg_vars["idle"].get(),
-                    shoulder_margin = self._cfg_vars["margin"].get(),
-                    progress_cb     = prog.update)
+                    padding_sec        = self._cfg_vars["padding"].get(),
+                    min_dur            = self._cfg_vars["min_dur"].get(),
+                    idle_sec           = self._cfg_vars["idle"].get(),
+                    shoulder_margin    = self._cfg_vars["margin"].get(),
+                    use_margin         = self._use_margin.get(),
+                    use_finger         = self._use_finger.get(),
+                    progress_cb        = prog.update)
 
                 result["frames"] = frames
                 result["fps"]    = fps
@@ -1092,8 +1195,8 @@ def main():
         description="VSL Auto Cut - folder browser + label manager")
     ap.add_argument("--data_dir", default=None,
                     help="Thu muc goc chua train/val/test (default: <project>/data/videos)")
-    ap.add_argument("--padding",  type=float, default=0.05)
-    ap.add_argument("--min_dur",  type=float, default=0.25)
+    ap.add_argument("--padding",  type=float, default=0.25)
+    ap.add_argument("--min_dur",  type=float, default=0.4)
     ap.add_argument("--idle_sec", type=float, default=0.7)
     ap.add_argument("--margin",   type=float, default=0.03)
     args = ap.parse_args()
