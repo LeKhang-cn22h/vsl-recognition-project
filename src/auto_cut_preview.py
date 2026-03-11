@@ -1,5 +1,6 @@
 """
-auto_cut_preview.py - VSL Video Cutter với folder browser + label manager
+auto_cut_preview.py - VSL Video Cutter voi folder browser + label manager
+Logic cat: tay TREN eo -> dang ky hieu; tay XUONG DUOI eo -> cat clip
 """
 
 import os, sys, cv2, json, time, argparse, threading, urllib.request, random
@@ -143,13 +144,30 @@ class Detector:
 
 
 def _shoulder_y(pose):
+    """Tra ve Y trung binh cua 2 vai (landmark 11, 12)."""
     if pose is None:
         return None
     ys = [pose[i].y for i in [11, 12] if pose[i].visibility > 0.3]
     return float(np.mean(ys)) if ys else None
 
 
+def _hip_y(pose):
+    """
+    Tra ve Y trung binh cua 2 hong (landmark 23, 24).
+    Trong toa do MediaPipe, Y tang tu tren xuong duoi (0=dinh, 1=day).
+    Tay nam TREN eo khi wrist_y < hip_y.
+    """
+    if pose is None:
+        return None
+    ys = [pose[i].y for i in [23, 24] if pose[i].visibility > 0.3]
+    return float(np.mean(ys)) if ys else None
+
+
 def _wrist_min_y(pose, hands):
+    """
+    Lay Y nho nhat (cao nhat tren man hinh) trong cac diem ban tay/co tay.
+    Uu tien hand landmarks (chinh xac hon), fallback sang pose wrists.
+    """
     ys = []
     for h in hands:
         ys += [h[0].y, h[8].y, h[4].y]
@@ -162,8 +180,8 @@ def _wrist_min_y(pose, hands):
 def _finger_curl_active(hands, curl_thresh=0.15):
     """
     Kiem tra ban tay co dang lam ky hieu (ngon co/gap) hay thua long.
-    - Tinh goc gap tại moi khop PIP cua 4 ngon tay (tro den ut).
-    - Nếu trung binh curl > curl_thresh -> dang cu dong.
+    - Tinh goc gap tai moi khop PIP cua 4 ngon tay (tro den ut).
+    - Neu trung binh curl > curl_thresh -> dang cu dong.
     Tra ve True neu it nhat 1 ban tay dang cu dong.
     """
     if not hands:
@@ -190,15 +208,24 @@ def _finger_curl_active(hands, curl_thresh=0.15):
 
 def analyze_frames(frames, fps,
                    padding_sec=0.25, min_dur=0.4, idle_sec=0.7,
-                   shoulder_margin=0.03, smooth_w=7,
-                   use_margin=True, use_finger=False,
+                   waist_offset=0.03, smooth_w=7,
+                   use_hip=True, use_finger=False,
                    finger_curl_thresh=0.15,
                    progress_cb=None):
     """
-    use_margin : bat dieu kien tay phai cao hon vai (shoulder_margin)
-    use_finger : bat dieu kien ngon tay phai dang cu dong (khong thua long)
-    Neu ca 2 bat -> can THOA BOTH dieu kien moi tinh la 'dang ky hieu'
-    Neu ca 2 tat -> moi frame co tay la 'dang ky hieu' (phat hien tat ca)
+    Phat hien cac doan co ky hieu tay dua tren vi tri tay so voi eo.
+
+    use_hip    : bat dieu kien tay phai TREN eo (waist_offset = bien do tinh chinh)
+                 - waist_offset > 0 : tay phai cao hon eo them 1 chut (chat hon)
+                 - waist_offset < 0 : cho phep tay thap hon eo mot chut (rong hon)
+                 Khi tay ha XUONG DUOI eo -> ket thuc segment hien tai.
+
+    use_finger : bat dieu kien ngon tay phai dang co/ky hieu (khong thua long)
+
+    Logic ket hop:
+      - Ca 2 bat  -> can THOA BOTH
+      - Chi 1 bat -> thoa dieu kien do
+      - Ca 2 tat  -> chi can co tay la du (fallback)
     """
     det = Detector(progress_cb)
     N   = len(frames)
@@ -209,25 +236,25 @@ def analyze_frames(frames, fps,
             progress_cb(f"Phan tich frame {i}/{N}  ({i*100//N}%)")
         pose, hands = det.detect(frame)
 
-        cond_margin = True
+        cond_hip    = True
         cond_finger = True
 
-        if use_margin:
-            sy = _shoulder_y(pose)
+        if use_hip:
+            hy = _hip_y(pose)
             wy = _wrist_min_y(pose, hands)
-            cond_margin = (sy is not None and wy is not None
-                           and wy < sy - shoulder_margin)
+            # Tay TREN eo: wy < hy (Y nho hon = cao hon tren man hinh)
+            # waist_offset duong: tay phai cao hon eo them offset do
+            # waist_offset am:    cho phep tay xuat hien thap hon eo them |offset|
+            cond_hip = (hy is not None and wy is not None
+                        and wy < hy - waist_offset)
 
         if use_finger:
             cond_finger = _finger_curl_active(hands, finger_curl_thresh)
 
-        # Neu bat ca 2: phai thoa ca hai
-        # Neu chi bat 1: thoa dieu kien do
-        # Neu tat ca 2: chi can co tay (hands detected)
-        if use_margin and use_finger:
-            active = cond_margin and cond_finger
-        elif use_margin:
-            active = cond_margin
+        if use_hip and use_finger:
+            active = cond_hip and cond_finger
+        elif use_hip:
+            active = cond_hip
         elif use_finger:
             active = cond_finger and bool(hands)
         else:
@@ -486,8 +513,8 @@ class App:
         self.is_playing = False
         self._play_job  = None
 
-        self._cfg_vars = {}
-        self._use_margin = tk.BooleanVar(value=True)   # bat mac dinh
+        self._cfg_vars  = {}
+        self._use_hip    = tk.BooleanVar(value=True)   # bat mac dinh: cat theo eo
         self._use_finger = tk.BooleanVar(value=False)  # tat mac dinh
 
         root.title(f"VSL Auto Cut  —  {data_dir}")
@@ -540,15 +567,15 @@ class App:
                     self.cfg.get("min_dur", 0.4))
         _make_param(pr, "idle(s)",    "idle",    0.2, 3.0, 0.1,
                     self.cfg.get("idle_sec", 0.7))
-        _make_param(pr, "margin",     "margin",  0.0, 0.15, 0.01,
-                    self.cfg.get("margin", 0.03))
+        # waist_offset: + = tay phai cao hon eo; - = cho phep tay thap hon eo
+        _make_param(pr, "waist_off",  "waist_offset", -0.3, 0.3, 0.01,
+                    self.cfg.get("waist_offset", 0.03))
 
-        # ── Toggle buttons: Margin + Finger ──────────────────────────
+        # ── Toggle buttons: Hip + Finger ─────────────────────────────
         tg = tk.Frame(tb, bg=PANEL)
         tg.pack(side=tk.RIGHT, padx=4)
 
         def _make_toggle(parent, text_on, text_off, var, hint):
-            """Nut bat/tat doi mau khi click."""
             btn_holder = [None]
 
             def _toggle():
@@ -567,7 +594,6 @@ class App:
                             padx=8, pady=5, command=_toggle)
             btn.pack(pady=2)
             btn_holder[0] = btn
-            # Tooltip nho
             tk.Label(parent, text=hint, bg=PANEL, fg=GRAY,
                      font=(MONO, 6)).pack()
             _refresh()
@@ -575,9 +601,9 @@ class App:
 
         tk.Label(tg, text="Bo loc", bg=PANEL, fg=GR2,
                  font=(MONO, 7, "bold")).pack()
-        _make_toggle(tg, "Margin tay>vai", "Margin OFF",
-                     self._use_margin,
-                     "tay phai cao hon vai")
+        _make_toggle(tg, "Tay > eo", "Tay > eo OFF",
+                     self._use_hip,
+                     "cat khi tay xuong duoi eo")
         _make_toggle(tg, "Finger curl", "Finger OFF",
                      self._use_finger,
                      "ngon tay dang co/ky hieu")
@@ -814,8 +840,8 @@ class App:
                     padding_sec        = self._cfg_vars["padding"].get(),
                     min_dur            = self._cfg_vars["min_dur"].get(),
                     idle_sec           = self._cfg_vars["idle"].get(),
-                    shoulder_margin    = self._cfg_vars["margin"].get(),
-                    use_margin         = self._use_margin.get(),
+                    waist_offset       = self._cfg_vars["waist_offset"].get(),
+                    use_hip            = self._use_hip.get(),
                     use_finger         = self._use_finger.get(),
                     progress_cb        = prog.update)
 
@@ -856,11 +882,13 @@ class App:
             self._set_status(
                 f"Phat hien {len(self.clips)} clip tu {path.name}")
         else:
-            self._set_status("Khong tim thay clip -- giam margin hoac min_dur")
+            self._set_status(
+                "Khong tim thay clip -- thu giam waist_off hoac min_dur")
             messagebox.showinfo(
                 "Khong tim thay",
                 "Khong phat hien ky hieu nao.\n\n"
-                "Thu giam tham so  margin  hoac  min_dur  tren thanh cong cu.")
+                "Thu giam tham so  waist_off  hoac  min_dur  tren thanh cong cu.\n"
+                "Hoac tat bo loc  'Tay > eo'  neu khong phat hien duoc hong.")
 
     def _on_clip_select(self, event=None):
         sel = self.clip_lb.curselection()
@@ -1193,12 +1221,13 @@ class App:
 def main():
     ap = argparse.ArgumentParser(
         description="VSL Auto Cut - folder browser + label manager")
-    ap.add_argument("--data_dir", default=None,
-                    help="Thu muc goc chua train/val/test (default: <project>/data/videos)")
-    ap.add_argument("--padding",  type=float, default=0.25)
-    ap.add_argument("--min_dur",  type=float, default=0.4)
-    ap.add_argument("--idle_sec", type=float, default=0.7)
-    ap.add_argument("--margin",   type=float, default=0.03)
+    ap.add_argument("--data_dir",     default=None,
+                    help="Thu muc goc chua train/val/test")
+    ap.add_argument("--padding",      type=float, default=0.25)
+    ap.add_argument("--min_dur",      type=float, default=0.4)
+    ap.add_argument("--idle_sec",     type=float, default=0.7)
+    ap.add_argument("--waist_offset", type=float, default=0.03,
+                    help="Bien do tinh chinh eo: + = chat hon, - = rong hon")
     args = ap.parse_args()
 
     if not HAS_TK:
@@ -1208,7 +1237,6 @@ def main():
         print("[ERROR] Can cai: pip install mediapipe")
         sys.exit(1)
 
-    # ── FIX: data_dir mac dinh la PROJECT_ROOT/data/videos ──────────
     if args.data_dir:
         data_dir = Path(args.data_dir)
     else:
@@ -1225,10 +1253,10 @@ def main():
     print(f"  Nhan hien co: {labels if labels else '(chua co)'}")
 
     cfg = {
-        "padding": args.padding,
-        "min_dur": args.min_dur,
-        "idle_sec": args.idle_sec,
-        "margin":  args.margin,
+        "padding":      args.padding,
+        "min_dur":      args.min_dur,
+        "idle_sec":     args.idle_sec,
+        "waist_offset": args.waist_offset,
     }
 
     root = tk.Tk()
