@@ -721,7 +721,7 @@ class WebcamVideoCollector:
             print("  Khong the mo webcam!")
             return
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)2
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         fps    = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
