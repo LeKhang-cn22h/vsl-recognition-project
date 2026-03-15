@@ -224,25 +224,31 @@ class FeatureParser:
 
 class FingerEncoder(nn.Module):
     """
-    Encode 6 nhóm ngón (wrist + 5 ngón) từ xyz landmarks của 1 bàn tay.
-
-    Mỗi nhóm có số khớp khác nhau:
-      wrist  = 1 điểm × 3 = 3  dim input
-      thumb  = 4 điểm × 3 = 12 dim input
-      index  = 4 điểm × 3 = 12 dim input
-      ... v.v.
-
-    Input:  hand (B, T, 21, 3)
-    Output: (B, T, 6, finger_dim)
+    Encode 6 nhóm ngón (wrist + 5 ngón) - TorchScript compatible
     """
-
     def __init__(self, out_dim: int = 32, dropout: float = 0.1):
         super().__init__()
-        self.out_dim  = out_dim
+        self.out_dim = out_dim
+        
+        # CÁCH 1: Hardcode indices (đơn giản, dễ hiểu)
+        # Định nghĩa finger groups ngay trong init
+        self.finger_names = ['wrist', 'thumb', 'index', 'middle', 'ring', 'pinky']
+        
+        # Register buffers để TorchScript biết đây là constants
+        self.register_buffer('wrist_idx',  torch.tensor([0], dtype=torch.long))
+        self.register_buffer('thumb_idx',  torch.tensor([1, 2, 3, 4], dtype=torch.long))
+        self.register_buffer('index_idx',  torch.tensor([5, 6, 7, 8], dtype=torch.long))
+        self.register_buffer('middle_idx', torch.tensor([9, 10, 11, 12], dtype=torch.long))
+        self.register_buffer('ring_idx',   torch.tensor([13, 14, 15, 16], dtype=torch.long))
+        self.register_buffer('pinky_idx',  torch.tensor([17, 18, 19, 20], dtype=torch.long))
+        
+        # Tạo encoders cho từng ngón
         self.encoders = nn.ModuleDict()
-
-        for fname, indices in cfg.FINGER_GROUPS.items():
-            in_dim = len(indices) * 3
+        for fname in self.finger_names:
+            # Lấy indices tương ứng
+            idx_tensor = getattr(self, f"{fname}_idx")
+            in_dim = len(idx_tensor) * 3  # mỗi landmark có 3 tọa độ xyz
+            
             self.encoders[fname] = nn.Sequential(
                 nn.Linear(in_dim, out_dim * 2),
                 nn.LayerNorm(out_dim * 2),
@@ -256,11 +262,17 @@ class FingerEncoder(nn.Module):
         """hand: (B, T, 21, 3) → (B, T, 6, out_dim)"""
         B, T, _, _ = hand.shape
         vecs = []
-        for fname in cfg.FINGER_NAMES:
-            idx     = cfg.FINGER_GROUPS[fname]
-            flat    = hand[:, :, idx, :].reshape(B, T, -1)
-            vecs.append(self.encoders[fname](flat))   # (B, T, out_dim)
-        return torch.stack(vecs, dim=2)               # (B, T, 6, out_dim)
+        
+        # Dùng self.finger_names thay vì cfg
+        for fname in self.finger_names:
+            # Lấy indices từ buffer đã đăng ký
+            idx = getattr(self, f"{fname}_idx")
+            # Chọn landmarks và flatten
+            flat = hand[:, :, idx, :].reshape(B, T, -1)
+            # Encode
+            vecs.append(self.encoders[fname](flat))
+            
+        return torch.stack(vecs, dim=2)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -270,39 +282,28 @@ class FingerEncoder(nn.Module):
 
 class CurlEncoder(nn.Module):
     """
-    Encode finger curl features của 1 bàn tay thành embedding.
-
-    Curl features (15,) cho 1 tay:
-      [curl_ratio_0, bend_angle_0, tip_dist_0,   ← ngón cái
-       curl_ratio_1, bend_angle_1, tip_dist_1,   ← ngón trỏ
-       ...                                        ← ... × 5 ngón]
-
-    Encode mỗi ngón riêng biệt để giữ thông tin ngón-specific,
-    rồi combine lại thành 1 vector biểu diễn trạng thái tay.
-
-    Input:  (B, T, 15)
-    Output: (B, T, curl_embed_dim)
+    Encode finger curl features - TorchScript compatible
     """
-
     def __init__(self, out_dim: int = 32, dropout: float = 0.1):
         super().__init__()
         self.out_dim = out_dim
-        n_fingers = 5   # thumb, index, middle, ring, pinky
-
-        # Encode từng ngón: 3 dim → per_finger_dim
-        per_dim = out_dim // n_fingers  # mỗi ngón góp 1 phần
-        remainder = out_dim - per_dim * (n_fingers - 1)
-
+        self.n_fingers = 5  # thumb, index, middle, ring, pinky
+        
+        # Tính toán dimensions
+        per_dim = out_dim // self.n_fingers
+        remainder = out_dim - per_dim * (self.n_fingers - 1)
+        
+        # Tạo encoders cho từng ngón
         self.finger_encs = nn.ModuleList()
-        for i in range(n_fingers):
-            o = remainder if i == n_fingers - 1 else per_dim
+        for i in range(self.n_fingers):
+            o = remainder if i == self.n_fingers - 1 else per_dim
             self.finger_encs.append(nn.Sequential(
                 nn.Linear(3, 16),
                 nn.GELU(),
                 nn.Linear(16, o),
             ))
-
-        # Sau khi concat tất cả ngón → project
+        
+        # Output projection
         self.out_proj = nn.Sequential(
             nn.LayerNorm(out_dim),
             nn.Linear(out_dim, out_dim),
@@ -314,10 +315,13 @@ class CurlEncoder(nn.Module):
         """curl: (B, T, 15) → (B, T, out_dim)"""
         B, T, _ = curl.shape
         parts = []
+        
         for i, enc in enumerate(self.finger_encs):
-            finger_feat = curl[:, :, i*3 : i*3+3]   # (B, T, 3)
+            # Mỗi ngón có 3 features
+            finger_feat = curl[:, :, i*3 : i*3+3]
             parts.append(enc(finger_feat))
-        combined = torch.cat(parts, dim=-1)           # (B, T, out_dim)
+            
+        combined = torch.cat(parts, dim=-1)
         return self.out_proj(combined)
 
 
@@ -556,11 +560,11 @@ class HandAwareVSLClassifier(nn.Module):
 
     def __init__(self, num_classes: int, cfg=cfg):
         super().__init__()
-        self.cfg = cfg
-
-        # ── Spatial modules ───────────────────────────────────────
+        self.cfg = cfg or Config()
         self.finger_encoder = FingerEncoder(
-            out_dim=cfg.FINGER_DIM, dropout=cfg.DROPOUT)
+            out_dim=self.cfg.FINGER_DIM, 
+            dropout=self.cfg.DROPOUT
+        )
 
         self.curl_encoder = CurlEncoder(
             out_dim=cfg.CURL_EMBED_DIM, dropout=cfg.DROPOUT)
