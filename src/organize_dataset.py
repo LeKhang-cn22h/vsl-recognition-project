@@ -7,7 +7,10 @@ from pathlib import Path
 # CẤU HÌNH
 # ══════════════════════════════════════════════════════════
 
-LABEL_SRC_DIR = r'data\videos\train\train'
+# Thư mục hiện tại chứa các label  (train/train/)
+LABEL_SRC_DIR = r'data\videos\train'
+
+# Thư mục gốc — train/ val/ test/ sẽ nằm ở đây  (data/videos/)
 SPLITS_ROOT   = r'data\videos'
 
 MIN_VIDEOS = 3
