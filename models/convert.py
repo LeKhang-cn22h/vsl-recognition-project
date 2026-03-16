@@ -1,39 +1,42 @@
 import os
-import tensorflow as tf
-import numpy as np
+import torch
+import ai_edge_torch
 
-# 1. Xác định đường dẫn tuyệt đối đến file script hiện tại
 current_dir = os.path.dirname(os.path.abspath(__file__))
+pt_path = os.path.join(current_dir, 'best.pt')
+tflite_path = os.path.join(current_dir, 'vsl_bilstm.tflite')
 
-# 2. Tạo đường dẫn đến file model. 
-# GIẢ SỬ file .h5 nằm cùng thư mục 'src' với file convert.py:
-model_path = os.path.join(current_dir, 'vsl_model.h5')
+# ---------------------------------------------------------
+# QUAN TRỌNG: KHỞI TẠO MÔ HÌNH TỪ CLASS CỦA BẠN
+# Thay thế 'YourBiLSTMClass' bằng tên class mạng của bạn
+# Ví dụ: from model_def import VSL_BiLSTM
+# model = VSL_BiLSTM(input_size=..., hidden_size=..., num_classes=...)
+# ---------------------------------------------------------
 
-# HOẶC nếu file nằm trong thư mục 'models' ngang hàng với 'src':
-# model_path = os.path.join(current_dir, '../models/vsl_model.h5')
+# Tạm gọi biến model (Bạn cần thay thế bằng code khởi tạo thực tế của bạn)
+# model = YourBiLSTMClass() 
 
-print(f"Đang tìm model tại: {model_path}")
+# Load trọng số vào mô hình
+print("Đang load trọng số...")
+model.load_state_dict(torch.load(pt_path, weights_only=True))
+model.eval()
 
-if not os.path.exists(model_path):
-    print("LỖI: Không tìm thấy file model! Hãy kiểm tra lại đường dẫn.")
-    exit()
+# ---------------------------------------------------------
+# TẠO DUMMY INPUT (Đầu vào giả lập)
+# Với BiLSTM, input thường là 3 chiều: (Batch_Size, Sequence_Length, Features_Size)
+# Ví dụ: Bạn nhận diện 30 khung hình, mỗi khung hình trích xuất 63 điểm landmark từ tay/mặt
+# Thì input sẽ là: (1, 30, 63)
+# ---------------------------------------------------------
+batch_size = 1
+sequence_length = 30 # Sửa lại cho đúng project của bạn
+features_size = 63   # Sửa lại cho đúng project của bạn
+dummy_input = torch.randn(batch_size, sequence_length, features_size)
 
-# 3. Load model với đường dẫn tuyệt đối
-model = tf.keras.models.load_model(model_path)
-
-# 2. Convert sang TFLite
-converter = tf.lite.TFLiteConverter.from_keras_model(model)
-converter.target_spec.supported_ops = [
-  tf.lite.OpsSet.TFLITE_BUILTINS, # Enable TensorFlow Lite ops.
-  tf.lite.OpsSet.SELECT_TF_OPS    # Enable TensorFlow ops.
-]
-tflite_model = converter.convert()
-
-# 3. Lưu file .tflite
-with open('vsl_model.tflite', 'wb') as f:
-    f.write(tflite_model)
-
-# 4. Xuất danh sách nhãn (Labels) từ file .npy ra text để copy vào Android
-labels_path = os.path.join(current_dir, 'label_encoder.npy')
-labels = np.load(labels_path, allow_pickle=True)
-print("Labels để copy vào Kotlin:", list(labels))
+# Chuyển đổi bằng ai-edge-torch
+print("Đang chuyển đổi PyTorch BiLSTM -> TFLite...")
+try:
+    edge_model = ai_edge_torch.convert(model, (dummy_input,))
+    edge_model.export(tflite_path)
+    print(f"✅ Hoàn tất! Đã lưu TFLite tại: {tflite_path}")
+except Exception as e:
+    print(f"❌ Lỗi trong quá trình chuyển đổi: {e}")

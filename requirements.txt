@@ -9,4 +9,3 @@ seaborn
 tqdm
 huggingface_hub
 python-dotenv
-ai-edge-torch
