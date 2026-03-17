@@ -8,7 +8,7 @@ from pathlib import Path
 # ══════════════════════════════════════════════════════════
 
 # Thư mục hiện tại chứa các label  (train/train/)
-LABEL_SRC_DIR = r'data\videos\train'
+LABEL_SRC_DIR = r'data\train'
 
 # Thư mục gốc — train/ val/ test/ sẽ nằm ở đây  (data/videos/)
 SPLITS_ROOT   = r'data\videos'

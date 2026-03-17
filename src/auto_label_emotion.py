@@ -53,7 +53,7 @@ from torchvision.models import efficientnet_b2, EfficientNet_B2_Weights
 # ══════════════════════════════════════════════════════════════════
 
 MODEL_PATH      = r'checkpoints/emotion_cnn_best.pth'
-VIDEO_DIR       = r'datamlp'
+VIDEO_DIR       = r'data/videos'
 CONF_THRESH_DEF = 0.70          # ngưỡng confidence mặc định
 
 EMOTION_MAP = {
