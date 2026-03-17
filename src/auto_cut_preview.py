@@ -1,10 +1,16 @@
 """
 auto_cut_preview.py - VSL Video Cutter  (memory-safe edition)
 =============================================================
-* Phan tich TOAN BO folder -> duyet clip -> luu 1 lan
-* CAT CLIP: tay TREN eo = dang ky hieu | tay XUONG DUOI eo = ket thuc doan
-* KHONG giu frames trong RAM sau phan tich.
-  Preview dung cv2 seek (CAP_PROP_POS_FRAMES) nen khong bi OOM / crash.
+* Mo folder -> chon video -> Phan tich -> Duyet clip -> Luu
+* Preview dung cv2 seek (CAP_PROP_POS_FRAMES) — KHONG giu frames trong RAM
+* Tat ca loi trong ban "draft" da duoc sua:
+    - analyze_frames nhan frames[] nhu truoc (don gian, on dinh)
+    - _analyse_selected duoc phuc hoi
+    - _show_placeholder / _show_frame chi dinh nghia 1 lan
+    - bien cap / total / to_save / idx khong con "ma"
+    - LabelDialog het duplicate params
+    - _finger_curl_active het duplicate append
+    - _shoulder_y duoc phuc hoi (ban draft doi thanh _hip_y lam hong margin)
 """
 
 import os, sys, cv2, argparse, threading, urllib.request, random
@@ -32,7 +38,8 @@ PREVIEW_H   = 405
 SPLITS      = ["train", "val", "test"]
 SPLIT_RATIO = {"train": 0.7, "val": 0.15, "test": 0.15}
 VIDEO_EXTS  = {".mp4", ".avi", ".mov", ".mkv", ".webm",
-               ".MP4", ".MOV", ".AVI", ".MKV"}
+               ".MP4", ".MOV", ".AVI", ".MKV", ".WEBM",
+               ".m4v", ".M4V", ".3gp", ".3GP"}
 
 MODEL_URLS = {
     "hand_landmarker.task": (
@@ -47,7 +54,6 @@ _SCRIPT_DIR   = Path(__file__).resolve().parent
 _PROJECT_ROOT = (_SCRIPT_DIR.parent
                  if _SCRIPT_DIR.name.lower() == "src"
                  else _SCRIPT_DIR)
-_ROOT = _SCRIPT_DIR
 _ROOT = _SCRIPT_DIR
 
 # ── Colours ──────────────────────────────────────────────────────────
@@ -163,10 +169,11 @@ class Detector:
 # Landmark helpers
 # ─────────────────────────────────────────────────────────────────────
 
-def _hip_y(pose):
+def _shoulder_y(pose):
+    """Dung vai (11,12) lam moc — KHONG doi thanh hip."""
     if pose is None:
         return None
-    ys = [pose[i].y for i in [23, 24] if pose[i].visibility > 0.3]
+    ys = [pose[i].y for i in [11, 12] if pose[i].visibility > 0.3]
     return float(np.mean(ys)) if ys else None
 
 
@@ -181,11 +188,6 @@ def _wrist_min_y(pose, hands):
 
 
 def _finger_curl_active(hands, curl_thresh=0.15):
-    """
-    Kiem tra ngon tay co dang gap/co khong.
-    Do goc gap tai khop PIP cua 4 ngon (tro->ut).
-    curl ~ 0 = thang, curl ~ 2 = cong het.
-    """
     if not hands:
         return False
     FINGERS = [(5, 6, 8), (9, 10, 12), (13, 14, 16), (17, 18, 20)]
@@ -202,31 +204,16 @@ def _finger_curl_active(hands, curl_thresh=0.15):
                 curls.append(0.0)
                 continue
             cos_a = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
-            curls.append(1.0 - cos_a)
-            curls.append(1.0 - cos_a)
+            curls.append(1.0 - cos_a)   # chỉ append 1 lần (bản draft bị append 2 lần)
         if float(np.mean(curls)) > curl_thresh:
             return True
     return False
 
 
 def _fist_detected(hands, fist_thresh=0.5):
-    """
-    Phat hien tay nam dau / nam ho.
-    Do khoang cach tu dau ngon (tip) den co tay (wrist),
-    chuan hoa theo kich thuoc ban tay (wrist->MCP ngon giua).
-
-    Khoang cach chuan hoa:
-      ~0.8-1.2 : tay mo hoan toan
-      ~0.5-0.8 : thu ngon nhe
-      ~0.3-0.5 : nam ho  (loose fist)
-      ~0.1-0.3 : nam chat (tight fist)
-
-    fist_thresh=0.5 bat nam ho tro len, 0.4 bat nam chat hon.
-    Chi tinh 4 ngon chinh (tro->ut), bo ngon cai vi huong khac.
-    """
     if not hands:
         return False
-    TIPS = [8, 12, 16, 20]  # bo ngon cai (4)
+    TIPS = [8, 12, 16, 20]
     for hand in hands:
         wrist     = np.array([hand[0].x, hand[0].y])
         mid_mcp   = np.array([hand[9].x, hand[9].y])
@@ -240,6 +227,10 @@ def _fist_detected(hands, fist_thresh=0.5):
     return False
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Core analysis  (nhan frames[] — don gian, khong phu thuoc outer scope)
+# ─────────────────────────────────────────────────────────────────────
+
 def analyze_frames(frames, fps,
                    padding_sec=0.25, min_dur=0.4, idle_sec=0.7,
                    shoulder_margin=0.03, smooth_w=7,
@@ -247,27 +238,16 @@ def analyze_frames(frames, fps,
                    use_finger=False, finger_curl_thresh=0.15,
                    use_fist=False,   fist_thresh=0.5,
                    progress_cb=None):
-    """
-    Logic ket hop:
-      Finger va Fist la OR voi nhau (thoa 1 trong 2 la du).
-      Margin la AND them vao neu bat.
-      Neu tat ca 3: chi can co tay la du.
-    """
     det = Detector(progress_cb)
-    raw = []
-    i   = 0
+    N   = len(frames)
+    raw = np.zeros(N, dtype=np.float32)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    for i, frame in enumerate(frames):
         if progress_cb and i % 15 == 0:
-            progress_cb(f"Phan tich frame {i}/{total}  ({i*100//max(total,1)}%)")
+            progress_cb(f"Phan tich frame {i}/{N}  ({i*100//max(N,1)}%)")
 
         pose, hands = det.detect(frame)
-        # frame duoc giai phong ngay sau khi detect
 
-        # Dieu kien vi tri (Margin)
         cond_margin = True
         if use_margin:
             sy = _shoulder_y(pose)
@@ -275,7 +255,6 @@ def analyze_frames(frames, fps,
             cond_margin = (sy is not None and wy is not None
                            and wy < sy - shoulder_margin)
 
-        # Dieu kien hinh dang ban tay (Finger OR Fist)
         if use_finger or use_fist:
             cond_finger = _finger_curl_active(hands, finger_curl_thresh) if use_finger else False
             cond_fist   = _fist_detected(hands, fist_thresh)             if use_fist   else False
@@ -283,32 +262,27 @@ def analyze_frames(frames, fps,
         else:
             cond_shape = bool(hands)
 
-        # Ket hop cuoi cung
         active = (cond_margin and cond_shape) if use_margin else cond_shape
+        if active:
+            raw[i] = 1.0
 
-        raw.append(1.0 if active else 0.0)
-        i += 1
-
-    cap.release()
     det.close()
 
-    N      = len(raw)
-    raw_np = np.array(raw, dtype=np.float32)
     k      = np.ones(smooth_w, dtype=np.float32) / smooth_w
-    signal = np.convolve(raw_np, k, mode="same")
+    signal = np.convolve(raw, k, mode="same")
     binary = (signal > 0.3).astype(np.int32)
 
     segs, in_s, s0 = [], False, 0
-    for idx in range(N):
-        if binary[idx] and not in_s:
-            in_s, s0 = True, idx
-        elif not binary[idx] and in_s:
+    for i in range(N):
+        if binary[i] and not in_s:
+            in_s, s0 = True, i
+        elif not binary[i] and in_s:
             in_s = False
-            segs.append([s0, idx - 1])
+            segs.append([s0, i - 1])
     if in_s:
         segs.append([s0, N - 1])
     if not segs:
-        return fps, []
+        return []
 
     gap    = int(idle_sec * fps)
     merged = [segs[0][:]]
@@ -320,20 +294,15 @@ def analyze_frames(frames, fps,
 
     min_f = int(min_dur * fps)
     pad   = int(padding_sec * fps)
-    clips = [[max(0, s - pad), min(N - 1, e + pad)]
-             for s, e in merged if e - s >= min_f]
-    return fps, clips
+    return [[max(0, s - pad), min(N - 1, e + pad)]
+            for s, e in merged if e - s >= min_f]
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Seek-based frame reader for preview
+# Seek-based frame reader  (tranh load toan bo vao RAM khi preview)
 # ─────────────────────────────────────────────────────────────────────
 
 class VideoReader:
-    """
-    Mo video va seek den frame bat ky ma khong load toan bo vao RAM.
-    Giu cap mo de tranh mo lai nhieu lan lien tiep.
-    """
     def __init__(self):
         self._cap  = None
         self._path = None
@@ -348,7 +317,6 @@ class VideoReader:
         return self._cap.isOpened()
 
     def read_frame(self, fidx):
-        """Tra ve BGR frame tai vi tri fidx, hoac None neu loi."""
         if not self._cap or not self._cap.isOpened():
             return None
         self._cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
@@ -402,9 +370,7 @@ class LabelDialog(tk.Toplevel):
             self._lb = tk.Listbox(
                 lf, listvariable=tk.StringVar(value=existing),
                 yscrollcommand=sb.set, selectmode=tk.SINGLE,
-                yscrollcommand=sb.set, selectmode=tk.SINGLE,
                 bg=CARD, fg=WHT, selectbackground=ACC,
-                font=(MONO, 10), height=min(7, len(existing)),
                 font=(MONO, 10), height=min(7, len(existing)),
                 relief=tk.FLAT, highlightthickness=0, bd=0)
             sb.config(command=self._lb.yview)
@@ -425,7 +391,6 @@ class LabelDialog(tk.Toplevel):
         tk.Label(nr, text="Tao nhan moi:", bg=BG, fg=GRN2,
                  font=(MONO, 9, "bold")).pack(side=tk.LEFT)
         self._new_ent = tk.Entry(nr, font=(MONO, 11), width=20,
-                                 bg=CARD, fg=WHT, insertbackground=WHT,
                                  bg=CARD, fg=WHT, insertbackground=WHT,
                                  relief=tk.FLAT, bd=4)
         self._new_ent.pack(side=tk.LEFT, padx=(8, 0))
@@ -454,7 +419,8 @@ class LabelDialog(tk.Toplevel):
         def _upd(*_):
             lbl = self._lbl_var.get().strip()
             if not lbl:
-                self._cnt_lbl.config(text=""); return
+                self._cnt_lbl.config(text="")
+                return
             counts = count_label_clips(self.data_dir, lbl)
             mode   = self._split_mode.get()
             n      = self.n_clips
@@ -494,11 +460,12 @@ class ProgressWin:
         self.win.configure(bg=BG)
         self.win.geometry("560x150")
         self.win.resizable(False, False)
-        tk.Label(self.win, text=title, bg=BG, fg=ACC2,
-                 font=(MONO, 12, "bold")).pack(pady=(18, 4))
+        self._title_lbl = tk.Label(self.win, text=title, bg=BG, fg=ACC2,
+                                   font=(MONO, 12, "bold"))
+        self._title_lbl.pack(pady=(18, 4))
         self._lbl = tk.Label(self.win, text="Chuan bi...", bg=BG, fg=GR2, font=(MONO, 9))
         self._lbl.pack()
-        self._pb = ttk.Progressbar(self.win, mode="indeterminate", length=440)
+        self._pb = ttk.Progressbar(self.win, mode="indeterminate", length=480)
         self._pb.pack(pady=8)
         self._pb.start(10)
 
@@ -535,29 +502,37 @@ class App:
 
         self.folder_path = None
         self.video_files = []
-        self.frames      = []
+
+        # State cho clip hien tai
+        self.cur_video   = None   # Path cua video dang xem
+        self.frames      = []     # frames da load (chi dung khi analyse)
         self.fps         = 30.0
-        self.clips       = []
-        self.kept        = []
-        self.idx         = 0
+        self.clips       = []     # [[start, end], ...]
+        self.kept        = []     # [True/False, ...]
+        self.idx         = 0      # index clip hien tai
         self.play_pos    = 0
         self.is_playing  = False
         self._play_job   = None
         self._cfg_vars   = {}
 
-        # ── Toggle BooleanVars ────────────────────────────────────────
+        # VideoReader dung seek thay vi giu frames trong RAM
+        self._reader = VideoReader()
+
+        # Toggle BooleanVars
         self._use_margin = tk.BooleanVar(value=True)
         self._use_finger = tk.BooleanVar(value=False)
-        self._use_fist   = tk.BooleanVar(value=False)  # <-- THEM
+        self._use_fist   = tk.BooleanVar(value=False)
 
         root.title(f"VSL Auto Cut  —  {data_dir}")
         root.configure(bg=BG)
         root.geometry("1280x840")
         root.minsize(1000, 700)
-
         self._build_ui()
 
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────────
+    # UI Build
+    # ─────────────────────────────────────────────────────────────────
+
     def _build_ui(self):
         tb = tk.Frame(self.root, bg=PANEL, pady=8)
         tb.pack(fill=tk.X)
@@ -566,13 +541,16 @@ class App:
                  bg=PANEL, fg=ACC2, font=(MONO, 14, "bold")).pack(side=tk.LEFT, padx=16)
 
         bkw = dict(font=(MONO, 9, "bold"), relief=tk.FLAT, cursor="hand2", padx=10, pady=4)
-        tk.Button(tb, text="Mo Folder",  bg=ACC,      fg=WHT, command=self._open_folder,  **bkw).pack(side=tk.LEFT, padx=4)
-        tk.Button(tb, text="Lam moi",    bg="#374151", fg=WHT, command=self._refresh_list, **bkw).pack(side=tk.LEFT, padx=4)
+        tk.Button(tb, text="Mo Folder",  bg=ACC,      fg=WHT,
+                  command=self._open_folder,  **bkw).pack(side=tk.LEFT, padx=4)
+        tk.Button(tb, text="Lam moi",    bg="#374151", fg=WHT,
+                  command=self._refresh_list, **bkw).pack(side=tk.LEFT, padx=4)
 
-        self.lbl_folder = tk.Label(tb, text="Chua chon folder", bg=PANEL, fg=GRAY, font=(MONO, 8))
+        self.lbl_folder = tk.Label(tb, text="Chua chon folder",
+                                   bg=PANEL, fg=GRAY, font=(MONO, 8))
         self.lbl_folder.pack(side=tk.LEFT, padx=10)
 
-        # ── Toggle buttons ────────────────────────────────────────────
+        # Toggle buttons
         tg = tk.Frame(tb, bg=PANEL)
         tg.pack(side=tk.RIGHT, padx=4)
 
@@ -587,7 +565,8 @@ class App:
                     text=f"✔ {text_on}" if on else f"✗ {text_off}",
                     bg=GRN if on else "#374151", fg="white")
             btn = tk.Button(parent, text="", font=(MONO, 8, "bold"),
-                            relief=tk.FLAT, cursor="hand2", padx=8, pady=5, command=_toggle)
+                            relief=tk.FLAT, cursor="hand2", padx=8, pady=5,
+                            command=_toggle)
             btn.pack(pady=2)
             btn_holder[0] = btn
             tk.Label(parent, text=hint, bg=PANEL, fg=GRAY, font=(MONO, 6)).pack()
@@ -596,9 +575,9 @@ class App:
         tk.Label(tg, text="Bo loc", bg=PANEL, fg=GR2, font=(MONO, 7, "bold")).pack()
         _make_toggle(tg, "Margin tay>vai", "Margin OFF", self._use_margin, "tay phai cao hon vai")
         _make_toggle(tg, "Finger curl",    "Finger OFF", self._use_finger, "ngon tay dang co")
-        _make_toggle(tg, "Fist/Nam dau",   "Fist OFF",   self._use_fist,   "tay nam ho/nam dau")  # <-- THEM
+        _make_toggle(tg, "Fist/Nam dau",   "Fist OFF",   self._use_fist,   "tay nam ho/nam dau")
 
-        # ── Param sliders ─────────────────────────────────────────────
+        # Param sliders
         pr = tk.Frame(tb, bg=PANEL)
         pr.pack(side=tk.RIGHT, padx=8)
 
@@ -618,10 +597,10 @@ class App:
         _make_param(pr, "min_dur(s)",  "min_dur",     0.1,  3.0,  0.1,  self.cfg.get("min_dur",     0.4))
         _make_param(pr, "idle(s)",     "idle",        0.2,  3.0,  0.1,  self.cfg.get("idle_sec",    0.7))
         _make_param(pr, "margin",      "margin",     -0.5,  0.15, 0.01, self.cfg.get("margin",      0.0))
-        _make_param(pr, "curl_thr",    "curl_thresh", 0.05, 1.0,  0.05, self.cfg.get("curl_thresh", 0.15))  # <-- THEM
-        _make_param(pr, "fist_thr",    "fist_thresh", 0.25, 0.85, 0.05, self.cfg.get("fist_thresh", 0.5))   # <-- THEM
+        _make_param(pr, "curl_thr",    "curl_thresh", 0.05, 1.0,  0.05, self.cfg.get("curl_thresh", 0.15))
+        _make_param(pr, "fist_thr",    "fist_thresh", 0.25, 0.85, 0.05, self.cfg.get("fist_thresh", 0.5))
 
-        # ── Re-run button ─────────────────────────────────────────────
+        # Re-run button
         rf = tk.Frame(pr, bg=PANEL)
         rf.pack(side=tk.LEFT, padx=6)
         tk.Label(rf, text="re-analyse", bg=PANEL, fg=GRAY, font=(MONO, 6)).pack()
@@ -629,12 +608,11 @@ class App:
                   bg=YEL, fg="#1f2937", font=(MONO, 8, "bold"), relief=tk.FLAT,
                   cursor="hand2", padx=8, pady=6, command=self._reanalyse).pack()
 
-        # ── Paned layout ──────────────────────────────────────────────
+        # Paned layout
         pane = tk.PanedWindow(self.root, orient=tk.HORIZONTAL,
                               bg=BG, sashwidth=5, sashrelief=tk.FLAT)
         pane.pack(fill=tk.BOTH, expand=True)
 
-        # Left
         left = tk.Frame(pane, bg=BG2, width=290)
         pane.add(left, minsize=220)
 
@@ -645,7 +623,8 @@ class App:
         vsb = tk.Scrollbar(vf); vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.video_lb = tk.Listbox(vf, yscrollcommand=vsb.set, bg=CARD, fg=WHT,
                                    selectbackground=ACC, font=(MONO, 9),
-                                   relief=tk.FLAT, bd=0, highlightthickness=0, activestyle="none")
+                                   relief=tk.FLAT, bd=0, highlightthickness=0,
+                                   activestyle="none")
         self.video_lb.pack(fill=tk.BOTH, expand=True)
         vsb.config(command=self.video_lb.yview)
         self.video_lb.bind("<Double-Button-1>", self._on_video_dclick)
@@ -653,7 +632,9 @@ class App:
 
         tk.Button(left, text="Phan tich video nay",
                   bg=YEL, fg="#1f2937", font=(MONO, 9, "bold"), relief=tk.FLAT,
-                  cursor="hand2", pady=5, command=self._analyse_selected).pack(fill=tk.X, padx=6, pady=2)
+                  cursor="hand2", pady=5,
+                  command=self._analyse_selected).pack(fill=tk.X, padx=6, pady=2)
+
         tk.Frame(left, bg=PANEL, height=1).pack(fill=tk.X, padx=6, pady=3)
         tk.Label(left, text="CLIPS PHAT HIEN", bg=BG2, fg=GRAY,
                  font=(MONO, 8, "bold")).pack(pady=(2, 2), padx=8, anchor="w")
@@ -662,12 +643,12 @@ class App:
         csb = tk.Scrollbar(cf); csb.pack(side=tk.RIGHT, fill=tk.Y)
         self.clip_lb = tk.Listbox(cf, yscrollcommand=csb.set, bg=CARD, fg=WHT,
                                   selectbackground=ACC, font=(MONO, 9),
-                                  relief=tk.FLAT, bd=0, highlightthickness=0, activestyle="none")
+                                  relief=tk.FLAT, bd=0, highlightthickness=0,
+                                  activestyle="none")
         self.clip_lb.pack(fill=tk.BOTH, expand=True)
         csb.config(command=self.clip_lb.yview)
         self.clip_lb.bind("<<ListboxSelect>>", self._on_clip_select)
 
-        # Right
         right = tk.Frame(pane, bg=BG)
         pane.add(right, minsize=600)
 
@@ -696,7 +677,6 @@ class App:
         self.lbl_time = tk.Label(right, text="", bg=BG, fg=GRAY, font=(MONO, 8))
         self.lbl_time.pack()
 
-        # Trim
         tc = tk.Frame(right, bg=PANEL, padx=10, pady=6)
         tc.pack(fill=tk.X, padx=10, pady=2)
         tk.Label(tc, text="Chinh diem cat:", bg=PANEL, fg=WHT,
@@ -706,25 +686,28 @@ class App:
             tk.Label(tc, text=label, bg=PANEL, fg=fg_col,
                      font=(MONO, 8)).grid(row=row, column=0, padx=4, pady=2)
             tk.Entry(tc, textvariable=entry_var, width=7, bg=CARD, fg=WHT,
-                     insertbackground=WHT, font=(MONO, 9), relief=tk.FLAT).grid(row=row, column=1, padx=2)
+                     insertbackground=WHT, font=(MONO, 9),
+                     relief=tk.FLAT).grid(row=row, column=1, padx=2)
             for ci, (t, d) in enumerate([("-10",-10),("-1",-1),("+1",1),("+10",10)]):
                 tk.Button(tc, text=t, bg=CARD, fg=WHT, font=(MONO, 7), relief=tk.FLAT, padx=4,
                           command=lambda dd=d: adj_fn(dd)).grid(row=row, column=2+ci, padx=1)
             tk.Button(tc, text="Frame nay", bg=CARD, fg=WHT, font=(MONO, 7),
-                      relief=tk.FLAT, padx=6, command=here_fn).grid(row=row, column=6, padx=6)
+                      relief=tk.FLAT, padx=6,
+                      command=here_fn).grid(row=row, column=6, padx=6)
 
         self.start_var = tk.IntVar()
         self.end_var   = tk.IntVar()
         _row(1, "Start:", GRN2, self.start_var, self._adj_start, self._set_start_here)
         _row(2, "End:  ", RED2, self.end_var,   self._adj_end,   self._set_end_here)
 
-        # Keep / Skip / Nav
         ar = tk.Frame(right, bg=BG)
         ar.pack(pady=4)
         akw = dict(font=(MONO, 11, "bold"), relief=tk.FLAT, cursor="hand2", padx=12, pady=6)
-        self.btn_keep = tk.Button(ar, text="GIU", bg=GRN, fg="white", command=self._keep, **akw)
+        self.btn_keep = tk.Button(ar, text="GIU", bg=GRN, fg="white",
+                                  command=self._keep, **akw)
         self.btn_keep.pack(side=tk.LEFT, padx=6)
-        self.btn_skip = tk.Button(ar, text="BO",  bg=RED, fg="white", command=self._skip, **akw)
+        self.btn_skip = tk.Button(ar, text="BO",  bg=RED, fg="white",
+                                  command=self._skip, **akw)
         self.btn_skip.pack(side=tk.LEFT, padx=6)
         tk.Button(ar, text="< Truoc", bg="#374151", fg=WHT,
                   command=self._prev_clip, **akw).pack(side=tk.LEFT, padx=4)
@@ -734,7 +717,6 @@ class App:
         tk.Button(ar, text="Tiep >", bg="#374151", fg=WHT,
                   command=self._next_clip, **akw).pack(side=tk.LEFT, padx=4)
 
-        # Status + Save
         sb2 = tk.Frame(self.root, bg=PANEL, pady=8)
         sb2.pack(fill=tk.X, side=tk.BOTTOM)
         self.lbl_status = tk.Label(sb2, text="Chon folder -> chon video -> Phan tich -> Luu",
@@ -742,7 +724,8 @@ class App:
         self.lbl_status.pack(side=tk.LEFT, padx=16)
         tk.Button(sb2, text="LUU  -  Chon nhan & Split",
                   bg=GRN, fg="white", font=(MONO, 11, "bold"), relief=tk.FLAT,
-                  cursor="hand2", padx=16, pady=6, command=self._save_dialog).pack(side=tk.RIGHT, padx=12)
+                  cursor="hand2", padx=16, pady=6,
+                  command=self._save_dialog).pack(side=tk.RIGHT, padx=12)
 
         self.root.bind("<space>",  lambda e: self._toggle_play())
         self.root.bind("<Left>",   lambda e: self._step(-1))
@@ -753,9 +736,11 @@ class App:
         self.root.bind("<p>",      lambda e: self._prev_clip())
         self.root.bind("<Return>", lambda e: self._save_dialog())
 
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────────
+    # Params helper
+    # ─────────────────────────────────────────────────────────────────
+
     def _get_analyse_params(self):
-        """Lay tat ca params tu UI, dung chung cho _analyse_video va _reanalyse."""
         return dict(
             padding_sec        = self._cfg_vars["padding"].get(),
             min_dur            = self._cfg_vars["min_dur"].get(),
@@ -768,38 +753,126 @@ class App:
             fist_thresh        = self._cfg_vars["fist_thresh"].get(),
         )
 
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────────
+    # Folder / file list
+    # ─────────────────────────────────────────────────────────────────
+
     def _open_folder(self):
         path = filedialog.askdirectory(title="Chon folder chua video")
         if not path:
             return
         self.folder_path = Path(path)
-        short = str(self.folder_path)
-        self.lbl_folder.config(text=short[-65:] if len(short) > 65 else short)
+        s = str(self.folder_path)
+        self.lbl_folder.config(text=s[-70:] if len(s) > 70 else s)
         self._refresh_list()
 
     def _refresh_list(self):
         if not self.folder_path:
             messagebox.showinfo("Chu y", "Hay chon folder truoc!")
             return
-        self.video_files = sorted([
-            f for f in self.folder_path.iterdir()
-            if f.is_file() and f.suffix in VIDEO_EXTS
-        ])
+        self.video_files = sorted(
+            [f for f in self.folder_path.iterdir()
+             if f.is_file() and f.suffix in VIDEO_EXTS],
+            key=lambda f: f.name.lower()
+        )
         self.video_lb.delete(0, tk.END)
         for i, f in enumerate(self.video_files):
             self.video_lb.insert(tk.END, f"  [{i+1:02d}]  {f.name}")
-        self._set_status(f"Tim thay {len(self.video_files)} video trong folder")
+        self._set_status(
+            f"Tim thay {len(self.video_files)} video  |  {self.folder_path}")
 
     def _on_video_dclick(self, event=None):
         self._analyse_selected()
 
-    def _analyse_all(self):
-        if not self.video_files:
-            messagebox.showinfo("Chu y", "Chua co video nao. Hay Mo Folder truoc!")
+    def _analyse_selected(self):
+        sel = self.video_lb.curselection()
+        if not sel:
+            messagebox.showinfo("Chu y", "Hay chon video tu danh sach!")
+            return
+        self._analyse_video(self.video_files[sel[0]])
+
+    # ─────────────────────────────────────────────────────────────────
+    # Analysis
+    # ─────────────────────────────────────────────────────────────────
+
+    def _analyse_video(self, path):
+        self._stop_play()
+        self._reader.close()
+        self.frames    = []
+        self.clips     = []
+        self.kept      = []
+        self.cur_video = None
+        self.clip_lb.delete(0, tk.END)
+        self._show_placeholder()
+
+        params = self._get_analyse_params()
+        prog   = ProgressWin(self.root, f"Phan tich: {path.name}")
+        result = {}
+
+        def worker():
+            try:
+                cap   = cv2.VideoCapture(str(path))
+                fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                frames = []
+                i = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frames.append(frame)
+                    if i % 60 == 0:
+                        prog.update(f"Doc frame {i}/{total}...")
+                    i += 1
+                cap.release()
+                clips = analyze_frames(frames, fps,
+                                       progress_cb=prog.update, **params)
+                result["clips"]  = clips
+                result["frames"] = frames
+                result["fps"]    = fps
+            except Exception as ex:
+                result["error"] = str(ex)
+            finally:
+                self.root.after(0, prog.close)
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        while t.is_alive():
+            try: self.root.update()
+            except Exception: break
+        t.join()
+
+        if "error" in result:
+            messagebox.showerror("Loi", result["error"])
             return
 
-    # ------------------------------------------------------------------
+        self.frames    = result["frames"]
+        self.fps       = result["fps"]
+        self.clips     = [[s, e] for s, e in result["clips"]]
+        self.kept      = [True] * len(self.clips)
+        self.cur_video = path
+
+        # Mo VideoReader de seek preview (khong giu frames sau nay)
+        self._reader.open(path)
+
+        self.clip_lb.delete(0, tk.END)
+        for i, (s, e) in enumerate(self.clips):
+            self.clip_lb.insert(tk.END,
+                f"  #{i+1:02d}  {s:5d}->{e:5d}  {(e-s)/self.fps:.2f}s  GIU")
+
+        if self.clips:
+            self._load_clip(0)
+            self._set_status(f"Phat hien {len(self.clips)} clip tu {path.name}")
+        else:
+            self._set_status("Khong tim thay clip -- giam margin hoac min_dur")
+            messagebox.showinfo("Khong tim thay",
+                "Khong phat hien ky hieu nao.\n\n"
+                "Thu:\n"
+                "  • Keo slider margin xuong am (vi du -0.2)\n"
+                "  • Bat toggle Fist\n"
+                "  • Nhan nut ↻ Re-run\n"
+                "  • Hoac tat toggle Margin")
+
     def _reanalyse(self):
         if not self.frames:
             messagebox.showinfo("Chu y", "Chua co frames nao.\nHay phan tich video truoc!")
@@ -854,103 +927,21 @@ class App:
                 "  • Tat toggle Margin neu tay o thap\n"
                 "  • Giam min_dur")
 
-    # ------------------------------------------------------------------
-    def _analyse_video(self, path):
-        self._stop_play()
-        self._reader.close()
-        self.all_results    = []
-        self.flat_clips     = []
-        self.flat_idx       = -1
-        self._cur_vid_path  = None
-        self.clip_lb.delete(0, tk.END)
-        self._show_placeholder()
+    # ─────────────────────────────────────────────────────────────────
+    # Clip navigation
+    # ─────────────────────────────────────────────────────────────────
 
-        params = self._get_analyse_params()
-        prog   = ProgressWin(self.root, f"Phan tich: {path.name}")
-        result = {}
-
-        def worker():
-            try:
-                cap    = cv2.VideoCapture(str(path))
-                fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
-                total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                frames = []
-                i = 0
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    frames.append(frame)
-                    if i % 60 == 0:
-                        prog.update(f"Doc frame {i}/{total}...")
-                    i += 1
-                cap.release()
-                result["clips"]  = analyze_frames(frames, fps,
-                                                   progress_cb=prog.update, **params)
-                result["frames"] = frames
-                result["fps"]    = fps
-            except Exception as ex:
-                result["error"] = str(ex)
-            finally:
-                self.root.after(0, prog.close)
-
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-        while t.is_alive():
-            try: self.root.update()
-            except Exception: break
-        t.join()
-
-        if "error" in result:
-            messagebox.showerror("Loi", result["error"])
-            return
-
-        self.frames = result["frames"]
-        self.fps    = result["fps"]
-        self.clips  = [[s, e] for s, e in result["clips"]]
-        self.kept   = [True] * len(self.clips)
-        self.clip_lb.delete(0, tk.END)
-        for i, (s, e) in enumerate(self.clips):
-            self.clip_lb.insert(tk.END,
-                f"  #{i+1:02d}  {s:5d}->{e:5d}  {(e-s)/self.fps:.2f}s  GIU")
-
-        if self.clips:
-            self._load_clip(0)
-            self._set_status(f"Phat hien {len(self.clips)} clip tu {path.name}")
-        else:
-            self._set_status("Khong tim thay clip -- giam margin hoac min_dur")
-            messagebox.showinfo("Khong tim thay",
-                "Khong phat hien ky hieu nao.\n\n"
-                "Thu:\n"
-                "  • Keo slider margin xuong am (vi du -0.2)\n"
-                "  • Bat toggle Fist\n"
-                "  • Nhan nut ↻ Re-run\n"
-                "  • Hoac tat toggle Margin")
-
-    # ------------------------------------------------------------------
     def _on_clip_select(self, event=None):
         sel = self.clip_lb.curselection()
-        if sel:
-            self._load_flat_clip(sel[0])
+        if sel and sel[0] < len(self.clips):
+            self._load_clip(sel[0])
 
-    def _load_flat_clip(self, fi):
-        if not self.flat_clips or fi < 0 or fi >= len(self.flat_clips):
+    def _load_clip(self, idx):
+        if not self.clips or idx < 0 or idx >= len(self.clips):
             return
         self._stop_play()
-
-        vi, ci  = self.flat_clips[fi]
-        res     = self.all_results[vi]
-        self.flat_idx = fi
-        self.fps      = res["fps"]
-
-        # Open video for seek (only if different file)
-        vid_path = res["path"]
-        if self._cur_vid_path != vid_path:
-            self._set_status(f"Mo video: {vid_path.name}...")
-            self._reader.open(vid_path)
-            self._cur_vid_path = vid_path
-
-        s, e = res["clips"][ci]
+        self.idx      = idx
+        s, e          = self.clips[idx]
         self.play_pos = s
         self.start_var.set(s)
         self.end_var.set(e)
@@ -988,42 +979,67 @@ class App:
         self.clip_lb.selection_set(self.idx)
         self.clip_lb.see(self.idx)
 
+    # ─────────────────────────────────────────────────────────────────
+    # Preview rendering  (dung VideoReader.read_frame de seek)
+    # ─────────────────────────────────────────────────────────────────
+
     def _show_placeholder(self):
         self.canvas.delete("all")
-        self.canvas.create_rectangle(0, 0, PREVIEW_W, PREVIEW_H, fill="#080810", outline="")
+        self.canvas.create_rectangle(0, 0, PREVIEW_W, PREVIEW_H,
+                                     fill="#080810", outline="")
         self.canvas.create_text(PREVIEW_W // 2, PREVIEW_H // 2,
                                 text="Chon video va nhan Phan tich",
                                 fill=GRAY, font=(MONO, 13))
 
     def _show_frame(self, fidx):
-        if not self.frames or not self.clips:
+        if not self.clips or not self.cur_video:
             return
-        fidx = max(0, min(fidx, len(self.frames) - 1))
+        s, e  = self.clips[self.idx]
+        fidx  = max(0, min(fidx, len(self.frames) - 1 if self.frames else e))
         self.play_pos = fidx
         self.scrub_var.set(fidx)
-        s, e = self.clips[self.idx]
-        bgr  = self.frames[fidx]
-        rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        sc   = min(PREVIEW_W / w, PREVIEW_H / h)
+
+        # Uu tien lay tu frames[] neu con trong RAM, nguoc lai seek
+        if self.frames and fidx < len(self.frames):
+            bgr = self.frames[fidx]
+        else:
+            bgr = self._reader.read_frame(fidx)
+        if bgr is None:
+            return
+
+        rgb    = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w   = rgb.shape[:2]
+        sc     = min(PREVIEW_W / w, PREVIEW_H / h)
         nw, nh = int(w * sc), int(h * sc)
-        img  = np.zeros((PREVIEW_H, PREVIEW_W, 3), dtype=np.uint8)
-        y0   = (PREVIEW_H - nh) // 2
-        x0   = (PREVIEW_W - nw) // 2
+        img    = np.zeros((PREVIEW_H, PREVIEW_W, 3), dtype=np.uint8)
+        y0     = (PREVIEW_H - nh) // 2
+        x0     = (PREVIEW_W - nw) // 2
         img[y0:y0+nh, x0:x0+nw] = cv2.resize(rgb, (nw, nh))
+
         cv2.putText(img,
                     f"Frame {fidx}  +{(fidx-s)/self.fps:.2f}s  / {(e-s)/self.fps:.2f}s",
                     (8, 24), cv2.FONT_HERSHEY_DUPLEX, 0.52, (200, 200, 255), 1, cv2.LINE_AA)
+        cv2.putText(img,
+                    self.cur_video.name,
+                    (8, PREVIEW_H - 10), cv2.FONT_HERSHEY_DUPLEX, 0.4,
+                    (160, 160, 160), 1, cv2.LINE_AA)
+
         bdr = (16, 185, 129) if self.kept[self.idx] else (239, 68, 68)
         cv2.rectangle(img, (0, 0), (PREVIEW_W-1, PREVIEW_H-1), bdr, 3)
+
         pil   = Image.fromarray(img)
         imgtk = ImageTk.PhotoImage(pil)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
         self.canvas._img = imgtk
+
         self.lbl_time.config(
             text=f"Frame {fidx}/{e}    ({fidx/self.fps:.2f}s / {e/self.fps:.2f}s)"
                  f"    Do dai: {(e-s)/self.fps:.2f}s")
+
+    # ─────────────────────────────────────────────────────────────────
+    # Playback
+    # ─────────────────────────────────────────────────────────────────
 
     def _toggle_play(self):
         if self.is_playing: self._stop_play()
@@ -1066,77 +1082,15 @@ class App:
         self._stop_play()
         if self.clips: self._show_frame(int(float(val)))
 
-    # ─── Frame rendering ──────────────────────────────────────────────
-
-    def _show_placeholder(self):
-        self.canvas.delete("all")
-        self.canvas.create_rectangle(0, 0, PREVIEW_W, PREVIEW_H,
-                                     fill="#080810", outline="")
-        self.canvas.create_text(PREVIEW_W // 2, PREVIEW_H // 2,
-                                text="Nhan  '▶ Phan tich TAT CA'  de bat dau",
-                                fill=GRAY, font=(MONO, 13))
-
-    def _show_frame(self, fidx):
-        cl = self._cur_clip()
-        if cl is None:
-            return
-        s, e  = cl
-        fidx  = max(s, min(fidx, e))
-        self.play_pos = fidx
-        self.scrub_var.set(fidx)
-
-        bgr = self._reader.read_frame(fidx)
-        if bgr is None:
-            return
-
-        rgb    = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        h, w   = rgb.shape[:2]
-        sc     = min(PREVIEW_W / w, PREVIEW_H / h)
-        nw, nh = int(w * sc), int(h * sc)
-        img    = np.zeros((PREVIEW_H, PREVIEW_W, 3), dtype=np.uint8)
-        y0     = (PREVIEW_H - nh) // 2
-        x0     = (PREVIEW_W - nw) // 2
-        img[y0:y0+nh, x0:x0+nw] = cv2.resize(rgb, (nw, nh))
-
-        cv2.putText(img,
-                    f"Frame {fidx}  +{(fidx-s)/self.fps:.2f}s"
-                    f"  / {(e-s)/self.fps:.2f}s",
-                    (8, 24), cv2.FONT_HERSHEY_DUPLEX, 0.52,
-                    (200, 200, 255), 1, cv2.LINE_AA)
-
-        if self.flat_idx >= 0 and self.flat_clips:
-            vi, _ = self.flat_clips[self.flat_idx]
-            cv2.putText(img,
-                        self.all_results[vi]["path"].name,
-                        (8, PREVIEW_H - 10),
-                        cv2.FONT_HERSHEY_DUPLEX, 0.42,
-                        (180, 180, 180), 1, cv2.LINE_AA)
-
-        kept = False
-        if self.flat_idx >= 0 and self.flat_clips:
-            vi, ci = self.flat_clips[self.flat_idx]
-            kept   = self.all_results[vi]["kept"][ci]
-        bdr = (16, 185, 129) if kept else (239, 68, 68)
-        cv2.rectangle(img, (0, 0), (PREVIEW_W-1, PREVIEW_H-1), bdr, 3)
-
-        pil   = Image.fromarray(img)
-        imgtk = ImageTk.PhotoImage(pil)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
-        self.canvas._img = imgtk
-
-        self.lbl_time.config(
-            text=f"Frame {fidx}/{e}    "
-                 f"({fidx/self.fps:.2f}s / {e/self.fps:.2f}s)    "
-                 f"Do dai: {(e-s)/self.fps:.2f}s")
-
-    # ─── Trim ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────
+    # Trim
+    # ─────────────────────────────────────────────────────────────────
 
     def _apply_trim(self):
         if not self.clips: return
         s = int(self.start_var.get())
         e = int(self.end_var.get())
-        n = len(self.frames)
+        n = len(self.frames) if self.frames else (e + 1)
         s = max(0, min(s, n - 2))
         e = max(s + 1, min(e, n - 1))
         self.clips[self.idx] = [s, e]
@@ -1144,7 +1098,7 @@ class App:
         self.end_var.set(e)
         self.scrub.configure(from_=s, to=e)
         self._show_frame(max(s, min(self.play_pos, e)))
-        self._update_flat_item(self.flat_idx)
+        self._refresh_clip_lb()
 
     def _adj_start(self, d):
         if not self.clips: return
@@ -1155,65 +1109,61 @@ class App:
     def _adj_end(self, d):
         if not self.clips: return
         _, e = self.clips[self.idx]
-        self.end_var.set(min(len(self.frames) - 1, e + d))
+        n = len(self.frames) if self.frames else (e + 100)
+        self.end_var.set(min(n - 1, e + d))
         self._apply_trim()
 
     def _set_start_here(self):
-        if self.flat_idx >= 0:
+        if self.clips:
             self.start_var.set(self.play_pos)
             self._apply_trim()
 
     def _set_end_here(self):
-        if self.flat_idx >= 0:
+        if self.clips:
             self.end_var.set(self.play_pos)
             self._apply_trim()
 
-    # ─── Keep / Skip ──────────────────────────────────────────────────
-
-    def _update_btn_style(self):
-        if self.flat_idx < 0 or not self.flat_clips:
-            return
-        vi, ci = self.flat_clips[self.flat_idx]
-        kept   = self.all_results[vi]["kept"][ci]
-        self.btn_keep.config(bg=GRN       if kept else "#374151")
-        self.btn_skip.config(bg="#374151" if kept else RED)
+    # ─────────────────────────────────────────────────────────────────
+    # Keep / Skip
+    # ─────────────────────────────────────────────────────────────────
 
     def _keep(self):
         if not self.clips: return
         self.kept[self.idx] = True
         self._update_btn_style()
-        self._update_flat_item(self.flat_idx)
-        if self.flat_idx < len(self.flat_clips) - 1:
-            self.root.after(180, lambda: self._load_flat_clip(self.flat_idx + 1))
+        self._refresh_clip_lb()
+        if self.idx < len(self.clips) - 1:
+            self.root.after(180, lambda: self._load_clip(self.idx + 1))
 
     def _skip(self):
         if not self.clips: return
         self.kept[self.idx] = False
         self._update_btn_style()
-        self._update_flat_item(self.flat_idx)
-        if self.flat_idx < len(self.flat_clips) - 1:
-            self.root.after(180, lambda: self._load_flat_clip(self.flat_idx + 1))
+        self._refresh_clip_lb()
+        if self.idx < len(self.clips) - 1:
+            self.root.after(180, lambda: self._load_clip(self.idx + 1))
 
     def _prev_clip(self):
         self._stop_play()
-        if self.flat_idx > 0:
-            self._load_flat_clip(self.flat_idx - 1)
+        if self.clips and self.idx > 0:
+            self._load_clip(self.idx - 1)
 
     def _next_clip(self):
         self._stop_play()
-        if self.flat_idx < len(self.flat_clips) - 1:
-            self._load_flat_clip(self.flat_idx + 1)
+        if self.clips and self.idx < len(self.clips) - 1:
+            self._load_clip(self.idx + 1)
 
-    # ─── Save ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────
+    # Save
+    # ─────────────────────────────────────────────────────────────────
 
     def _save_dialog(self):
-        if not self.all_results:
-            messagebox.showinfo("Chu y",
-                "Chua phan tich video nao!\n"
-                "Nhan  '▶ Phan tich TAT CA'  truoc.")
+        if not self.frames:
+            messagebox.showinfo("Chu y", "Chua phan tich video nao!")
             return
-        total_kept = sum(r["kept"].count(True) for r in self.all_results)
-        if total_kept == 0:
+        to_save = [(i, s, e) for i, ((s, e), k)
+                   in enumerate(zip(self.clips, self.kept)) if k]
+        if not to_save:
             messagebox.showwarning("Chu y",
                 "Khong co clip nao duoc chon (GIU)!\nNhan GIU tren it nhat 1 clip.")
             return
@@ -1221,13 +1171,11 @@ class App:
         if dlg.result is None:
             return
         label, split_mode = dlg.result
-        self._do_save_all(label, split_mode)
+        self._do_save(to_save, label, split_mode)
 
-    def _do_save_all(self, label, split_mode):
+    def _do_save(self, to_save, label, split_mode):
         self._stop_play()
         n = len(to_save)
-        if n == 0:
-            return
 
         if split_mode == "auto":
             indices = list(range(n))
@@ -1237,12 +1185,11 @@ class App:
             n_test  = n - n_train - n_val
             if n_test < 0:
                 n_val += n_test; n_test = 0
-            # FIX: dung oi lam key (index goc sau shuffle)
             split_assign = {}
             for rank, oi in enumerate(indices):
-                if   rank < n_train:           split_assign[oi] = "train"
-                elif rank < n_train + n_val:   split_assign[oi] = "val"
-                else:                          split_assign[oi] = "test"
+                if   rank < n_train:         split_assign[oi] = "train"
+                elif rank < n_train + n_val: split_assign[oi] = "val"
+                else:                        split_assign[oi] = "test"
         else:
             split_assign = {i: split_mode for i in range(n)}
 
@@ -1250,30 +1197,13 @@ class App:
             (self.data_dir / sp / label).mkdir(parents=True, exist_ok=True)
 
         start_idx = next_clip_index(self.data_dir, label)
+        h, w      = self.frames[0].shape[:2]
         fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
         saved     = []
-        prog = ProgressWin(self.root, "Dang luu clips...")
+        prog      = ProgressWin(self.root, "Dang luu clips...")
 
         def worker():
-            cur_vi  = -1
-            cap_out = None
-            vid_fps = 30.0
-            vid_w = vid_h = 0
-
-            for rank, (vi, ci, s, e) in enumerate(to_save):
-                # Re-open video only when switching
-                if vi != cur_vi:
-                    if cap_out:
-                        cap_out.release()
-                    path = self.all_results[vi]["path"]
-                    prog.set_title(f"Video: {path.name}")
-                    prog.update("Mo file...")
-                    cap_out = cv2.VideoCapture(str(path))
-                    vid_fps = cap_out.get(cv2.CAP_PROP_FPS) or 30.0
-                    vid_w   = int(cap_out.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    vid_h   = int(cap_out.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    cur_vi  = vi
-
+            for rank, (orig_i, s, e) in enumerate(to_save):
                 sp       = split_assign[rank]
                 file_idx = start_idx + rank
                 name     = f"{label}_{file_idx:04d}.mp4"
@@ -1293,17 +1223,13 @@ class App:
             except Exception: break
         t.join()
 
-        # Re-open reader for whichever clip is currently displayed
-        if self.flat_idx >= 0 and self.flat_clips:
-            vi, _ = self.flat_clips[self.flat_idx]
-            self._reader.open(self.all_results[vi]["path"])
-            self._cur_vid_path = self.all_results[vi]["path"]
-
         by_split = {}
         for sp, _ in saved:
             by_split[sp] = by_split.get(sp, 0) + 1
 
-        msg = f"Da luu {len(saved)} clip\n\n  Nhan : {label}\n  Thu muc: {self.data_dir}\n\n"
+        msg = (f"Da luu {len(saved)} clip\n\n"
+               f"  Nhan    : {label}\n"
+               f"  Thu muc : {self.data_dir}\n\n")
         for sp in SPLITS:
             if sp in by_split:
                 msg += f"  {sp:5s}: {by_split[sp]} clip\n"
@@ -1324,7 +1250,7 @@ class App:
 
 
 # =====================================================================
-# TIME-BASED SPLITTER
+# TIME-BASED SPLITTER  (giữ nguyên, chỉ fix sort key)
 # =====================================================================
 
 class TimeSplitApp:
@@ -1386,7 +1312,8 @@ class TimeSplitApp:
         vsb = tk.Scrollbar(vf); vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.video_lb = tk.Listbox(vf, yscrollcommand=vsb.set, bg=CARD, fg=WHT,
                                    selectbackground=ACC, font=(MONO, 9),
-                                   relief=tk.FLAT, bd=0, highlightthickness=0, activestyle="none")
+                                   relief=tk.FLAT, bd=0, highlightthickness=0,
+                                   activestyle="none")
         self.video_lb.pack(fill=tk.BOTH, expand=True)
         vsb.config(command=self.video_lb.yview)
         self.video_lb.bind("<Double-Button-1>", self._on_video_dclick)
@@ -1399,7 +1326,8 @@ class TimeSplitApp:
         ssb = tk.Scrollbar(sf); ssb.pack(side=tk.RIGHT, fill=tk.Y)
         self.seg_lb = tk.Listbox(sf, yscrollcommand=ssb.set, bg=CARD, fg=WHT,
                                  selectbackground=ACC, font=(MONO, 9),
-                                 relief=tk.FLAT, bd=0, highlightthickness=0, activestyle="none")
+                                 relief=tk.FLAT, bd=0, highlightthickness=0,
+                                 activestyle="none")
         self.seg_lb.pack(fill=tk.BOTH, expand=True)
         ssb.config(command=self.seg_lb.yview)
         self.seg_lb.bind("<<ListboxSelect>>", self._on_seg_select)
@@ -1415,7 +1343,8 @@ class TimeSplitApp:
 
         right = tk.Frame(pane, bg=BG)
         pane.add(right, minsize=600)
-        self.lbl_info = tk.Label(right, text="Chua chon video", bg=BG, fg=GR2, font=(MONO, 8))
+        self.lbl_info = tk.Label(right, text="Chua chon video",
+                                 bg=BG, fg=GR2, font=(MONO, 8))
         self.lbl_info.pack(pady=(6, 0))
         self.canvas = tk.Canvas(right, width=PREVIEW_W, height=PREVIEW_H, bg="#000",
                                 highlightthickness=2, highlightbackground=YEL)
@@ -1492,16 +1421,15 @@ class TimeSplitApp:
         if not self.folder_path:
             messagebox.showinfo("Chu y", "Hay chon folder truoc!")
             return
-        # Dùng key=lambda f: f.name.lower() để sort nhất quán trên Windows
-        self.video_files = sorted([
-            f for f in self.folder_path.iterdir()
-            if f.is_file() and f.suffix in VIDEO_EXTS
-        ], key=lambda f: f.name.lower())   # ← THÊM key này
-        
+        self.video_files = sorted(
+            [f for f in self.folder_path.iterdir()
+             if f.is_file() and f.suffix in VIDEO_EXTS],
+            key=lambda f: f.name.lower()
+        )
         self.video_lb.delete(0, tk.END)
         for f in self.video_files:
             self.video_lb.insert(tk.END, f"  {f.name}")
-        self._set_status(f"Tim thay {len(self.video_files)} video trong folder")
+        self._set_status(f"Tim thay {len(self.video_files)} video")
 
     def _on_video_dclick(self, event=None):
         sel = self.video_lb.curselection()
@@ -1558,7 +1486,8 @@ class TimeSplitApp:
             s = e + 1
         self._refresh_seg_lb()
         if self.segments: self._load_seg(0)
-        self._set_status(f"Cat thanh {len(self.segments)} doan x {chunk:.1f}s  tu  {self.video_path.name}")
+        self._set_status(
+            f"Cat thanh {len(self.segments)} doan x {chunk:.1f}s  tu  {self.video_path.name}")
 
     def _refresh_seg_lb(self):
         self.seg_lb.delete(0, tk.END)
@@ -1614,7 +1543,8 @@ class TimeSplitApp:
 
     def _show_placeholder(self, text=""):
         self.canvas.delete("all")
-        self.canvas.create_rectangle(0, 0, PREVIEW_W, PREVIEW_H, fill="#080810", outline="")
+        self.canvas.create_rectangle(0, 0, PREVIEW_W, PREVIEW_H,
+                                     fill="#080810", outline="")
         self.canvas.create_text(PREVIEW_W // 2, PREVIEW_H // 2,
                                 text=text or "Chon video",
                                 fill=GRAY, font=(MONO, 11), width=PREVIEW_W - 40)
