@@ -1256,12 +1256,11 @@ def main():
         description="Train HandAware VSL Classifier (208 dim — finger curl)",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
-Ví dụ:
   python train.py
   python train.py --epochs 100 --batch_size 16
   python train.py --finger_dim 64 --temporal_layers 6
   python train.py --data_dir data/processed
-  python train.py --no_plots          # bỏ qua bước vẽ biểu đồ
+  python train.py --no_plots          
         """
     )
     parser.add_argument("--data_dir",        default="data/processed")
